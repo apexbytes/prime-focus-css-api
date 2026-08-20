@@ -18,8 +18,12 @@ npm install
 cp .env.example .env      # defaults match the Docker Compose database
 npm run db:up             # start PostgreSQL on localhost:5434
 npm run db:migrate        # create extensions and apply migrations
+npm run db:seed           # roles, permissions, and the one default administrator
 npm run dev               # http://localhost:3000
 ```
+
+`db:seed` prints the generated administrator password once. That account is the only
+way into a fresh deployment — there is no sign-up endpoint. Everyone else is invited.
 
 Verify:
 
@@ -57,6 +61,32 @@ RUN_DB_TESTS=1 npm test
 
 Without `RUN_DB_TESTS=1` they skip, so `npm test` works with no database.
 
+## Signing in
+
+Authentication is password + a one-time code emailed to the user. There is no
+authenticator app and nothing to enrol.
+
+```bash
+# 1. password → a code is emailed, and a challenge id comes back
+curl -sX POST localhost:3000/api/v1/auth/login -H 'content-type: application/json' \
+  -d '{"email":"admin@primefocus.co.zw","password":"..."}'
+
+# 2. the code, optionally trusting this device for 30 days
+curl -sX POST localhost:3000/api/v1/auth/otp/verify -H 'content-type: application/json' \
+  -d '{"challengeId":"...","code":"123456","trustDevice":true}'
+```
+
+In development no email is sent: `EMAIL_TRANSPORT` falls back to `log`, so the code and
+any invitation link are printed to the server output. Pass the `deviceToken` from step 2
+on a later login to skip the code.
+
+To add a colleague, `POST /api/v1/invitations` with their email, name and the `roleId`
+they should hold. They receive a link, choose a password at
+`POST /api/v1/invitations/accept`, and are signed in immediately.
+
+Seeded roles: `super_admin`, `admin`, `tier2_specialist`, `tier1_agent`. Only
+`super_admin` can change what a role may do.
+
 ## Conventions
 
 Each entity is a folder under `src/modules/` with its own
@@ -72,5 +102,8 @@ Cross-module traffic goes service → service through the other module's
 Two more rules worth knowing before writing code:
 
 - `process.env` is read only in `src/config/env.ts`. Everything else imports `env`.
+- Nothing presented as a bearer credential is stored in the clear. Passwords are Argon2id;
+  refresh tokens, device tokens, invitation and reset tokens, API keys and login codes are
+  stored as keyed HMAC digests.
 - Customer PII and credentials never go into logs. `src/lib/logger/redact.ts` is
   the safety net, not the strategy — log IDs and reference codes.

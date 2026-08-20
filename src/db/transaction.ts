@@ -6,6 +6,14 @@ const log = createModuleLogger('db:transaction');
 /** The transaction-scoped database handle. Repositories accept this or `db`. */
 export type Transaction = Parameters<Parameters<typeof db.transaction>[0]>[0];
 
+/**
+ * What a repository function runs against: either the pool or an open
+ * transaction. Repositories take this as their last argument, defaulted to the
+ * pool, so a service can compose several of them into one atomic unit without
+ * the repository knowing.
+ */
+export type Executor = typeof db | Transaction;
+
 export interface TransactionContext {
   tx: Transaction;
   /**

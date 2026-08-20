@@ -3,6 +3,7 @@ export {
   envSchema,
   parseEnv,
   corsOrigins,
+  emailTransport,
   isDevelopment,
   isProduction,
   isTest,

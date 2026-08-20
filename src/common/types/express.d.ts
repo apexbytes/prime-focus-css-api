@@ -5,6 +5,8 @@ declare global {
       requestId: string;
       /** High-resolution start time in ms, used for duration logging. */
       startedAt: number;
+      /** Set by the authenticate middleware; absent on public routes. */
+      actor?: import('./actor.js').Actor;
     }
   }
 }

@@ -10,8 +10,17 @@
 // -- infrastructure -----------------------------------------------------------
 export * from './models/idempotency-key.model.js';
 
+// -- phase 2: identity & access ----------------------------------------------
+export * from '../modules/role/role.model.js';
+export * from '../modules/user/user.model.js';
+export * from '../modules/invitation/invitation.model.js';
+export * from '../modules/auth/auth.model.js';
+export * from '../modules/mfa/mfa.model.js';
+export * from '../modules/team/team.model.js';
+export * from '../modules/api-key/api-key.model.js';
+export * from '../modules/audit/audit.model.js';
+
 // -- modules ------------------------------------------------------------------
-// Phase 2: auth, user, role, team, api-key, audit
 // Phase 3: product, customer, ticket, message, attachment, category, tag, macro
 // Phase 4: sla, escalation, routing
 // Phase 5: knowledge-base, survey, report

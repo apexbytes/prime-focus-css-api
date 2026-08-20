@@ -20,10 +20,12 @@
     "db:studio": "drizzle-kit studio",
     "db:up": "docker compose up -d postgres",
     "db:down": "docker compose down",
-    "db:reset": "docker compose down -v && docker compose up -d postgres && sleep 3 && npm run db:migrate",
-    "check": "npm run format:check && npm run lint && npm run typecheck && npm run test"
+    "db:reset": "docker compose down -v && docker compose up -d postgres && sleep 4 && npm run db:migrate && npm run db:seed",
+    "check": "npm run format:check && npm run lint && npm run typecheck && npm run test",
+    "db:seed": "tsx src/db/seed.ts"
   },
   "dependencies": {
+    "@node-rs/argon2": "^2.1.0",
     "compression": "^1.8.1",
     "cors": "^2.8.6",
     "dotenv": "^17.4.2",
@@ -31,7 +33,9 @@
     "express": "^5.2.1",
     "express-rate-limit": "^8.6.2",
     "helmet": "^8.3.0",
+    "jose": "^6.2.9",
     "pg": "^8.23.0",
+    "resend": "^6.21.0",
     "uuid": "^14.0.2",
     "winston": "^3.19.0",
     "winston-daily-rotate-file": "^5.0.0",

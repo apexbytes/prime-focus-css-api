@@ -23,7 +23,16 @@ export function correlationId(req: Request, res: Response, next: NextFunction): 
   req.startedAt = performance.now();
   res.setHeader(REQUEST_ID_HEADER, requestId);
 
-  runWithContext({ requestId, method: req.method, path: req.path }, () => {
-    next();
-  });
+  runWithContext(
+    {
+      requestId,
+      method: req.method,
+      path: req.path,
+      ip: req.ip,
+      userAgent: req.get('user-agent'),
+    },
+    () => {
+      next();
+    },
+  );
 }
