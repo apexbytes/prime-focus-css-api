@@ -18,7 +18,7 @@ endpoints, and build order. It is deliberately narrower than
 | Migrations         | `drizzle-kit` (SQL files, checked in)                                         | Reviewable, replayable, no runtime schema sync                                                                                              |
 | Validation         | Zod                                                                           | One schema drives runtime validation + inferred TS types                                                                                    |
 | Auth               | JWT access (15 min) + rotating refresh tokens in Postgres; Argon2id passwords | Stateless reads, revocable sessions                                                                                                         |
-| MFA                | TOTP via `otplib` + hashed recovery codes                                     | Mandatory for staff, no SMS cost/SIM-swap risk                                                                                              |
+| MFA                | Emailed one-time code + 30-day trusted devices                                | No enrolment step, no shared secret at rest, and no authenticator app for agents to lose. Trusted devices keep the friction off every login |
 | Email              | Resend (outbound + inbound webhook)                                           | Requirement; inbound webhook is the email→ticket channel                                                                                    |
 | Logging            | Winston + `AsyncLocalStorage` correlation IDs                                 | Requirement; JSON to stdout, daily-rotate file in prod                                                                                      |
 | Async work         | `pg-boss` (Postgres-backed queue + cron)                                      | Retries, scheduling, dead-letter — no extra broker to run (see §11)                                                                         |
@@ -153,9 +153,18 @@ only file `drizzle-kit` reads.
 
 **Dependency rule (enforced by lint, `eslint-plugin-boundaries`):**
 `routes → controller → service → repository → db`. Controllers never touch
-repositories. Repositories never call services. Cross-module calls go
-service → service via the other module's `index.ts` barrel — never into
-another module's repository.
+repositories. Repositories never call services. Cross-module calls go service → service
+by importing the other module's `*.service.ts` directly; the `index.ts` barrel is for
+router and app wiring. Reaching another module's **repository** is what the rule forbids.
+
+Two exceptions the lint config allows explicitly, because forbidding them would be worse:
+a repository may join another module's _table_ (one database, one schema — the alternative
+is N+1 queries across service calls), and a `*.types.ts` may import another module's DTOs,
+which is compile-time only.
+
+`auth.service` and `user.service` import each other: login has to read users, and
+suspending a user has to revoke sessions. Both export hoisted function declarations and
+touch each other only inside function bodies, so the ES module cycle resolves safely.
 
 ---
 
@@ -165,8 +174,18 @@ Grouped by domain; each is a folder in `src/modules/`.
 
 ### 3.1 Identity & access
 
-- **auth** — register (staff invite accept), login, refresh, logout, logout-all, password reset, email verification, session listing.
-- **mfa** — TOTP enrol/verify/disable, recovery codes, step-up challenge during login.
+- **auth** — login (password, then an emailed code), OTP verify/resend, refresh with
+  rotation and reuse detection, logout, logout-everywhere, password reset and change,
+  session listing and revocation. **There is no register or sign-up endpoint**: accounts
+  exist only by invitation.
+- **mfa** — issues and verifies the emailed login code, and manages trusted devices
+  (`/auth/devices`). Not TOTP: there is no enrolment and no shared secret stored, so a
+  lost phone costs nothing. A device that has passed one code may skip the challenge for
+  `TRUSTED_DEVICE_TTL_DAYS`; the password is still required every time.
+- **invitation** — the only way a staff account comes into existence. An account holder
+  with `user:invite` supplies email, name and **the role the invitee will hold**; the
+  account is created in `invited` state with no password, and a one-time link is emailed.
+  Accepting sets the password, activates the account and signs the user in.
 - **user** — staff CRUD, status (active/suspended), profile, availability (online/away/offline), skills, capacity limits.
 - **role** — roles, permissions catalogue, role↔permission matrix. Permissions are string codes (`ticket:read`, `ticket:assign`, `report:view`, `user:manage`).
 - **team** — teams, membership, per-product team defaults, business hours binding.
@@ -213,11 +232,15 @@ Conventions: `uuid` v7 primary keys, `created_at`/`updated_at` timestamptz,
 soft delete only where legally useful (`deleted_at` on customer/user), all
 timestamps stored UTC and rendered in `Africa/Harare`.
 
-**Identity**
-`users`, `roles`, `permissions`, `role_permissions`, `teams`, `team_members`,
-`agent_skills`, `sessions` (refresh-token families), `password_reset_tokens`,
-`email_verification_tokens`, `mfa_secrets`, `mfa_recovery_codes`,
-`login_attempts`, `api_keys`.
+**Identity** — built in Phase 2
+`users`, `roles`, `permissions`, `role_permissions`, `invitations`, `teams`,
+`team_members`, `sessions` (refresh-token families), `password_reset_tokens`,
+`login_attempts`, `otp_challenges`, `trusted_devices`, `api_keys`, `audit_logs`.
+
+No `mfa_secrets` or `mfa_recovery_codes`: an emailed code needs neither. No
+`email_verification_tokens` either — accepting an invitation _is_ the proof of address
+control, so a separate verification step would verify the same fact twice.
+`agent_skills` arrives with Phase 4 routing.
 
 **Context**
 `products`, `customers`, `customer_product_accounts`, `customer_merges`.
@@ -262,20 +285,38 @@ portal uses the same JWT with a `customer` actor type; product systems use
 API keys.
 
 ```
-POST   /auth/login                      → tokens | { mfaRequired, challengeId }
-POST   /auth/mfa/verify
-POST   /auth/refresh
-POST   /auth/logout
-POST   /auth/password/forgot | /reset
-GET    /auth/me
-GET    /auth/sessions                   DELETE /auth/sessions/:id
+POST   /auth/login                  { email, password, deviceToken? }
+                                    → { status: 'authenticated', tokens, user }
+                                    | { status: 'otp_required', challengeId, expiresAt }
+POST   /auth/otp/verify             { challengeId, code, trustDevice? } → tokens [+ deviceToken]
+POST   /auth/otp/resend             { challengeId }
+POST   /auth/refresh                { refreshToken } → rotated pair
+POST   /auth/logout | /auth/logout-all
+GET    /auth/me                     → profile + effective permissions
+GET    /auth/sessions               DELETE /auth/sessions/:id
+GET    /auth/devices                DELETE /auth/devices/:id   (trusted devices)
+POST   /auth/password/forgot        { email }            (always 202)
+POST   /auth/password/reset         { token, password }   (revokes all sessions + devices)
+POST   /auth/password/change        { currentPassword, newPassword }
 
-POST   /mfa/enrol | /mfa/activate | /mfa/recovery-codes   DELETE /mfa
+POST   /invitations                 { email, fullName, roleId }   (perm user:invite)
+GET    /invitations                 POST /invitations/:id/resend
+DELETE /invitations/:id             (revoke)
+POST   /invitations/verify          { token }             (public: render accept screen)
+POST   /invitations/accept          { token, password, fullName? } → active + signed in
 
-GET    /users  POST /users  GET|PATCH /users/:id
-PATCH  /users/:id/status | /users/:id/availability | /users/:id/skills
-GET    /roles  POST /roles  PATCH /roles/:id  GET /permissions
-GET    /teams  POST /teams  POST /teams/:id/members
+GET    /users  GET /users/:id       PATCH /users/me
+PATCH  /users/:id                   (self, or perm user:manage)
+PATCH  /users/:id/role | /users/:id/status
+GET    /roles  POST /roles  GET|PATCH /roles/:id  DELETE /roles/:id
+PUT    /roles/:id/permissions       (perm role:manage — super_admin only by default)
+GET    /permissions
+GET    /teams  POST /teams  GET|PATCH /teams/:id
+POST   /teams/:id/members           DELETE /teams/:id/members/:userId
+GET    /api-keys  POST /api-keys    DELETE /api-keys/:id
+GET    /audit-logs?entity=&actor=&action=&from=&to=
+
+Notably absent, by design: no POST /users, no /auth/register, no /auth/signup.
 
 GET    /products  POST /products  PATCH /products/:id
 
@@ -319,6 +360,10 @@ GET    /healthz | /readyz          (mounted at the root, NOT under /api/v1 —
                                     orchestrators expect unversioned probes)
 ```
 
+**Tokens never travel in a URL.** Invitation and password-reset tokens are accepted in
+the request body only (`POST /invitations/verify`, not `GET /invitations/:token`), because
+URLs land in browser history, `Referer` headers and proxy logs.
+
 ### Response contract
 
 ```jsonc
@@ -356,8 +401,20 @@ stable machine `code` from a single enum, never a raw driver message.
   published to the queue after commit.
 - **Rate limits.** Per-IP on `/auth/*`, per-actor on writes, per-API-key
   quotas for product systems.
-- **Secrets.** MFA secrets and API keys encrypted/hashed at rest; JWT signing
-  key from env, rotatable via `kid`.
+- **Secrets.** Passwords are Argon2id. Everything else presented as a bearer value —
+  refresh tokens, device tokens, invitation and reset tokens, API keys — is stored only
+  as an HMAC-SHA256 digest keyed by `JWT_SECRET`, so a database leak yields nothing
+  replayable. Login codes are hashed the same way and additionally bound to their
+  challenge id. The signing key is rotatable via `kid`.
+- **Account enumeration.** A wrong password and an unknown address return an identical
+  401, and both pay the same Argon2 cost (`burnPasswordVerify`). Lockout, suspension and
+  not-yet-activated states are disclosed only to a caller who already supplied the correct
+  password — except invited accounts, which have no password to check and must be told to
+  use their invitation. `POST /auth/password/forgot` always answers 202.
+- **Revocation latency.** The authenticate middleware reads the user row on every request,
+  so suspension and role changes take effect immediately rather than after the access
+  token's 15 minutes. Role → permission lookups are cached in-process for 60 seconds and
+  invalidated on write.
 - **Compliance.** Zimbabwe's Cyber and Data Protection Act (2021) shapes
   retention: audit logs 7 years, ticket bodies 5 years, then anonymise
   customer PII in place; attachment deletion is hard, its audit row is not.
@@ -409,9 +466,26 @@ Two additions beyond the original Phase 1 list, both deliberate:
 - **Local PostgreSQL on host port 5434**, because 5432 and 5433 are commonly
   already taken. The container port is unchanged; CI uses 5432.
 
-**Phase 2 — identity**
-auth, mfa, user, role, team, api-key, audit. Ends with: an admin can invite an
-agent, the agent logs in with TOTP, and every action is audited.
+**Phase 2 — identity** — _complete_
+auth, mfa (emailed OTP + trusted devices), invitation, user, role, team, api-key, audit,
+plus the Resend adapter pulled forward from Phase 3 because invitations and login codes
+both need email. 15 tables, 4 seeded roles, 21 permissions, and the single seeded
+administrator that bootstraps everything else.
+
+Verified end to end: the seeded administrator signs in with a password and an emailed
+code, invites an agent with a chosen role, the agent accepts the link and sets a password,
+and every step lands in the audit trail with the acting user attached.
+
+Deviations from the original plan, all deliberate:
+
+- **Emailed OTP instead of TOTP**, and trusted devices to keep it off every login.
+- **No sign-up.** One seeded account; everyone else is invited. The invitation carries the
+  role, so a new account never exists without one.
+- **Resend moved from Phase 3 to Phase 2** — unavoidable once the first step of account
+  creation is an email. Without an API key the transport logs the message instead of
+  sending it, which is how development and tests run; production refuses to boot without a
+  key unless `EMAIL_TRANSPORT=log` is set on purpose.
+- **`lib/jwt`** wraps `jose`, keeping token mechanics out of the auth service.
 
 **Phase 3 — ticketing core**
 product, customer, ticket, message, attachment, category, tag, macro,

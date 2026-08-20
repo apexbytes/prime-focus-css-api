@@ -10,6 +10,10 @@ export default defineConfig({
       LOG_LEVEL: 'error',
       // Overridden in CI. Integration specs only run when RUN_DB_TESTS=1.
       DATABASE_URL: 'postgres://css:css@localhost:5434/prime_focus_css',
+      // Flow specs drive many logins from one IP; rateLimit.test.ts covers the
+      // limiter itself with its own budget.
+      AUTH_RATE_LIMIT_MAX: '5000',
+      RATE_LIMIT_MAX: '100000',
     },
     coverage: {
       provider: 'v8',
@@ -18,5 +22,10 @@ export default defineConfig({
     },
     restoreMocks: true,
     clearMocks: true,
+    // The integration suites share one Postgres database and truncate it
+    // between cases, so two files running at once would wipe each other's
+    // fixtures. Sequential files, and no concurrent cases within a file.
+    fileParallelism: false,
+    sequence: { concurrent: false },
   },
 });

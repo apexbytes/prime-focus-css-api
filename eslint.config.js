@@ -117,6 +117,12 @@ export default tseslint.config(
           capture: ['module'],
         },
         {
+          type: 'module-middleware',
+          pattern: 'src/modules/*/*.middleware.ts',
+          mode: 'file',
+          capture: ['module'],
+        },
+        {
           type: 'module-shared',
           pattern: 'src/modules/*/*.{schema,types,events,policy,mapper}.ts',
           mode: 'file',
@@ -153,7 +159,17 @@ export default tseslint.config(
               from: el('module-routes'),
               allow: allow(
                 anyOf('config', 'common'),
+                // Route files wire middleware, including another module's
+                // authenticate/authorize exposed through its barrel.
+                anyOf('module-index', 'module-middleware'),
                 own('module-controller'),
+                own('module-shared'),
+              ),
+            },
+            {
+              from: el('module-middleware'),
+              allow: allow(
+                anyOf('config', 'common', 'lib', 'module-service'),
                 own('module-shared'),
               ),
             },
@@ -170,8 +186,9 @@ export default tseslint.config(
               allow: allow(
                 anyOf('config', 'common', 'lib', 'db'),
                 // Cross-module traffic is service → service or via the barrel,
-                // never into another module's repository.
-                anyOf('module-service', 'module-index'),
+                // never into another module's repository. `module-shared` is the
+                // type-only surface (DTOs) of another module.
+                anyOf('module-service', 'module-index', 'module-shared'),
                 own('module-repository'),
                 own('module-model'),
                 own('module-shared'),
@@ -181,7 +198,10 @@ export default tseslint.config(
               from: el('module-repository'),
               allow: allow(
                 anyOf('config', 'common', 'lib', 'db'),
-                own('module-model'),
+                // Any module's model: a repository joins tables, and one schema
+                // in one database is the whole point of a modular monolith.
+                // Still forbidden: another module's repository or service.
+                el('module-model'),
                 own('module-shared'),
               ),
             },
@@ -199,7 +219,13 @@ export default tseslint.config(
             },
             {
               from: el('module-shared'),
-              allow: allow(anyOf('config', 'common', 'lib', 'db'), own('module-shared')),
+              allow: allow(
+                anyOf('config', 'common', 'lib', 'db'),
+                // Another module's DTOs, for composed response types.
+                el('module-shared'),
+                // A types file re-exports its own module's inferred row types.
+                own('module-model'),
+              ),
             },
             {
               from: el('module-index'),
@@ -208,6 +234,7 @@ export default tseslint.config(
                 own('module-routes'),
                 own('module-service'),
                 own('module-jobs'),
+                own('module-middleware'),
                 own('module-shared'),
                 own('module-model'),
               ),
@@ -246,8 +273,16 @@ export default tseslint.config(
     },
   },
   {
-    files: ['src/db/migrate.ts'],
+    files: ['src/db/migrate.ts', 'src/db/seed.ts', 'src/db/seeds/*.ts'],
     rules: { 'no-console': 'off' },
+  },
+  {
+    files: ['**/*.d.ts'],
+    rules: {
+      // A global augmentation file must stay non-module, so inline `import()`
+      // type references are the only option.
+      '@typescript-eslint/consistent-type-imports': 'off',
+    },
   },
   // Config files live outside the typed program.
   {

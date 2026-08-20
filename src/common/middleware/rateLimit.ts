@@ -6,7 +6,7 @@ import { AppError } from '../errors/index.js';
  * In-memory limiter. Correct for a single process; Phase 6 swaps the store for
  * Redis so limits hold across instances without touching call sites.
  */
-function build(options: {
+export function createRateLimiter(options: {
   windowMs: number;
   limit: number;
   skipOperational?: boolean;
@@ -26,7 +26,7 @@ function build(options: {
 }
 
 /** Broad protection applied to the whole API. */
-export const globalRateLimit = build({
+export const globalRateLimit = createRateLimiter({
   windowMs: env.RATE_LIMIT_WINDOW_MS,
   limit: env.RATE_LIMIT_MAX,
   skipOperational: true,
@@ -36,4 +36,7 @@ export const globalRateLimit = build({
  * Tight limiter for credential endpoints. Used from Phase 2 on `/auth/login`,
  * `/auth/password/forgot` and MFA verification.
  */
-export const authRateLimit = build({ windowMs: 15 * 60 * 1000, limit: 10 });
+export const authRateLimit = createRateLimiter({
+  windowMs: env.AUTH_RATE_LIMIT_WINDOW_MS,
+  limit: env.AUTH_RATE_LIMIT_MAX,
+});
