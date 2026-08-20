@@ -1,5 +1,6 @@
 import { sql } from 'drizzle-orm';
 import { db } from '../../src/db/client.js';
+import { seedCatalogue } from '../../src/db/seeds/catalogue.js';
 import { seedPermissions, seedRoles } from '../../src/db/seeds/identity.js';
 import { clearOutbox } from '../../src/lib/resend/index.js';
 import { invalidatePermissionCache } from '../../src/modules/role/role.service.js';
@@ -10,6 +11,24 @@ import { invalidatePermissionCache } from '../../src/modules/role/role.service.j
  */
 const TABLES = [
   'audit_logs',
+  'inbound_emails',
+  'outbound_emails',
+  'email_events',
+  'notifications',
+  'notification_preferences',
+  'attachments',
+  'ticket_messages',
+  'ticket_tags',
+  'ticket_assignments',
+  'ticket_watchers',
+  'tickets',
+  'tags',
+  'macros',
+  'categories',
+  'customer_product_accounts',
+  'customers',
+  'user_products',
+  'products',
   'login_attempts',
   'sessions',
   'password_reset_tokens',
@@ -31,6 +50,11 @@ export async function resetDatabase(): Promise<void> {
   await db.execute(sql.raw(`truncate table ${TABLES.join(', ')} restart identity cascade`));
   await seedPermissions();
   await seedRoles();
+  await seedCatalogue();
+
+  // Ticket references come from a sequence, so tests would otherwise see numbers
+  // climbing across files.
+  await db.execute(sql.raw('alter sequence ticket_reference_seq restart with 1'));
 
   // The cache is keyed by role id, and truncation gives roles new ids.
   invalidatePermissionCache();

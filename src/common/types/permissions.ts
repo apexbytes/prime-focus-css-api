@@ -32,6 +32,20 @@ export const PERMISSION_CATALOGUE = [
   { code: 'api_key:manage', description: 'Issue and revoke API keys', category: 'api_keys' },
   // audit
   { code: 'audit:read', description: 'Read the audit trail', category: 'audit' },
+  // products
+  { code: 'product:read', description: 'View the product catalogue', category: 'products' },
+  {
+    code: 'product:manage',
+    description: 'Create products and grant agents access to them',
+    category: 'products',
+  },
+  // customers
+  { code: 'customer:read', description: 'View customer records', category: 'customers' },
+  {
+    code: 'customer:manage',
+    description: 'Create, edit and merge customer records',
+    category: 'customers',
+  },
   // tickets (Phase 3)
   { code: 'ticket:read', description: 'View tickets', category: 'tickets' },
   {
@@ -56,6 +70,11 @@ export const PERMISSION_CATALOGUE = [
     category: 'tickets',
   },
   { code: 'ticket:delete', description: 'Delete tickets and attachments', category: 'tickets' },
+  {
+    code: 'ticket:read_all_products',
+    description: 'See tickets across every product, ignoring per-product access grants',
+    category: 'tickets',
+  },
   // knowledge base (Phase 5)
   { code: 'kb:read', description: 'Read knowledge base articles', category: 'knowledge_base' },
   {
@@ -114,12 +133,17 @@ export const SYSTEM_ROLES: readonly SystemRoleDefinition[] = [
       'api_key:read',
       'api_key:manage',
       'audit:read',
+      'product:read',
+      'product:manage',
+      'customer:read',
+      'customer:manage',
       'ticket:read',
       'ticket:reply',
       'ticket:assign',
       'ticket:assign_self',
       'ticket:escalate',
       'ticket:manage',
+      'ticket:read_all_products',
       'kb:read',
       'kb:manage',
       'sla:manage',
@@ -133,6 +157,9 @@ export const SYSTEM_ROLES: readonly SystemRoleDefinition[] = [
     permissions: [
       'user:read',
       'team:read',
+      'product:read',
+      'customer:read',
+      'customer:manage',
       'ticket:read',
       'ticket:reply',
       'ticket:assign',
@@ -151,6 +178,8 @@ export const SYSTEM_ROLES: readonly SystemRoleDefinition[] = [
     permissions: [
       'user:read',
       'team:read',
+      'product:read',
+      'customer:read',
       'ticket:read',
       'ticket:reply',
       'ticket:assign_self',

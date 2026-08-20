@@ -8,7 +8,22 @@ const log = createModuleLogger('email');
 export interface OutboundEmail extends RenderedEmail {
   to: string;
   /** Categorises the send in logs and in Resend's dashboard. */
-  kind: 'invitation' | 'login_otp' | 'password_reset' | 'password_changed';
+  kind:
+    | 'invitation'
+    | 'login_otp'
+    | 'password_reset'
+    | 'password_changed'
+    | 'ticket_reply'
+    | 'ticket_acknowledgement';
+  /**
+   * RFC 5322 Message-ID to send as. Set for ticket replies so the customer's
+   * response carries it in `In-Reply-To`, which is how the reply threads back
+   * onto its ticket.
+   */
+  messageId?: string;
+  /** The customer's message this is answering, for clients that thread on it. */
+  inReplyTo?: string;
+  references?: string[];
 }
 
 export interface SendResult {
@@ -75,6 +90,7 @@ export async function sendEmail(message: OutboundEmail): Promise<SendResult> {
 
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt += 1) {
     try {
+      const headers = threadingHeaders(message);
       const response = await client.emails.send({
         from: env.RESEND_FROM,
         to: message.to,
@@ -82,6 +98,7 @@ export async function sendEmail(message: OutboundEmail): Promise<SendResult> {
         html: message.html,
         text: message.text,
         ...(env.RESEND_REPLY_TO ? { replyTo: env.RESEND_REPLY_TO } : {}),
+        ...(headers ? { headers } : {}),
         tags: [{ name: 'kind', value: message.kind }],
       });
 
@@ -111,6 +128,16 @@ export async function sendEmail(message: OutboundEmail): Promise<SendResult> {
     err: lastError,
   });
   return { delivered: false, messageId: null, transport: 'resend' };
+}
+
+/** Threading headers, omitted entirely for transactional mail that has no thread. */
+function threadingHeaders(message: OutboundEmail): Record<string, string> | null {
+  const headers: Record<string, string> = {};
+  if (message.messageId) headers['Message-ID'] = message.messageId;
+  if (message.inReplyTo) headers['In-Reply-To'] = message.inReplyTo;
+  if (message.references?.length) headers['References'] = message.references.join(' ');
+
+  return Object.keys(headers).length > 0 ? headers : null;
 }
 
 export { emailTransport };

@@ -87,6 +87,53 @@ they should hold. They receive a link, choose a password at
 Seeded roles: `super_admin`, `admin`, `tier2_specialist`, `tier1_agent`. Only
 `super_admin` can change what a role may do.
 
+## Ticketing
+
+Every ticket belongs to exactly one product, and **agents only see the products they are
+granted**. Grant access with `POST /products/:id/agents`; an agent with no grants sees an
+empty queue. Administrators hold `ticket:read_all_products` and see everything.
+
+```bash
+# raise a ticket (the body becomes the opening message in the thread)
+curl -sX POST localhost:3000/api/v1/tickets -H "authorization: Bearer $TOKEN" \
+  -H 'content-type: application/json' -d '{
+    "productId": "...", "subject": "Transfer never arrived",
+    "body": "I sent $50 two hours ago.", "customerEmail": "customer@example.co.zw"
+  }'
+
+# reply to the customer, or leave a note only staff can see
+curl -sX POST localhost:3000/api/v1/tickets/$ID/messages -H "authorization: Bearer $TOKEN" \
+  -H 'content-type: application/json' -d '{"body":"Reversed.","visibility":"public"}'
+```
+
+`visibility` has no default on purpose: `public` emails the customer, `internal` never
+leaves the system, and guessing wrong would send a private note to a customer.
+
+Tickets arriving by email, web form or API trigger an **acknowledgement email** carrying
+the reference, so the customer knows their query is tracked before an agent gets to it.
+Agent-raised tickets skip it — the customer was just told the reference on the call. Turn
+it off with `SEND_TICKET_ACKNOWLEDGEMENT=false`.
+
+### Inbound email
+
+Resend's `email.received` webhook carries **metadata only**, so the pipeline persists the
+envelope, answers 202, then fetches the body from Resend's received-email API. Point a
+Resend inbound webhook at `POST /api/v1/webhooks/resend/inbound` and set
+`RESEND_WEBHOOK_SECRET`; without the secret the endpoint refuses everything rather than
+trusting unverified mail.
+
+Routing is by recipient address — each product has a `supportEmail`. An email matching no
+product is parked as `failed` rather than filed under a guess; fix the routing and retry it
+with `POST /api/v1/email/inbound/:id/reprocess`. Retrieving bodies needs a real
+`RESEND_API_KEY`, so inbound mail cannot be exercised end to end locally without one.
+
+### Attachments
+
+One client flow, two backends. `POST /tickets/:id/attachments/upload-url` returns somewhere
+to `PUT` the bytes: a presigned URL when object storage is configured (`STORAGE_BUCKET` and
+credentials), otherwise an API URL that writes to `./storage`. Local files are gitignored —
+they are real customer documents.
+
 ## Conventions
 
 Each entity is a folder under `src/modules/` with its own

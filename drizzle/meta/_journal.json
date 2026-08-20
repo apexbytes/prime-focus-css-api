@@ -15,6 +15,13 @@
       "when": 1787234929498,
       "tag": "0001_phase2_identity_access",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1787239135695,
+      "tag": "0002_phase3_ticketing",
+      "breakpoints": true
     }
   ]
 }

@@ -133,3 +133,18 @@ export async function seedIdentity(): Promise<void> {
   await seedRoles();
   await seedDefaultAdmin();
 }
+
+/**
+ * Gives an account access to every product. The seeded administrator holds
+ * `ticket:read_all_products`, so this exists for granting agents access in bulk
+ * during setup rather than for the administrator itself.
+ */
+export async function grantAllProducts(userId: string): Promise<number> {
+  const { products, userProducts } = await import('../../modules/product/product.model.js');
+  const rows = await db.select({ id: products.id }).from(products);
+
+  for (const row of rows) {
+    await db.insert(userProducts).values({ userId, productId: row.id }).onConflictDoNothing();
+  }
+  return rows.length;
+}

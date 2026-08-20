@@ -193,7 +193,7 @@ Grouped by domain; each is a folder in `src/modules/`.
 
 ### 3.2 Customer & product context
 
-- **product** — the Prime Focus product catalogue (code, name, active). Every ticket, SLA policy, category, and KB article is product-scoped. This is the tenancy axis of the whole system.
+- **product** — the Prime Focus product catalogue, and the tenancy axis of the whole system. Access is **per agent**: `user_products` records who may work which product, and every ticket read takes a scope argument derived from it. An agent with no grant sees nothing; only holders of `ticket:read_all_products` (administrators) bypass it. A ticket outside the caller's scope answers **404, not 403** — whether it exists is itself information. Products also carry a `supportEmail`, which is how inbound mail is routed.
 - **customer** — end users: contact details, language, tier, per-product account links (`customer_product_accounts`), merge of duplicate identities, 360° timeline endpoint.
 
 ### 3.3 Ticketing core
@@ -245,10 +245,16 @@ control, so a separate verification step would verify the same fact twice.
 **Context**
 `products`, `customers`, `customer_product_accounts`, `customer_merges`.
 
-**Ticketing**
-`tickets`, `ticket_messages`, `attachments`, `categories`, `tags`,
-`ticket_tags`, `ticket_assignments` (history), `ticket_watchers`,
-`ticket_locks`, `macros`.
+**Ticketing** — built in Phase 3
+`products`, `user_products`, `customers`, `customer_product_accounts`, `categories`,
+`tickets`, `ticket_messages`, `ticket_assignments` (history), `ticket_watchers`, `tags`,
+`ticket_tags`, `attachments`, `macros`, `inbound_emails`, `outbound_emails`,
+`email_events`, `notifications`, `notification_preferences`, plus the
+`ticket_reference_seq` sequence.
+
+`ticket_locks` waits for Phase 6, alongside the WebSocket layer that would use it.
+Ticket references come from a **sequence**, not a count: two concurrent creates would
+otherwise race to the same number.
 
 **Service levels**
 `sla_policies`, `business_hours`, `holidays`, `ticket_sla_targets`,
@@ -324,19 +330,33 @@ GET    /customers?search=  POST /customers  GET|PATCH /customers/:id
 GET    /customers/:id/tickets | /timeline
 POST   /customers/:id/merge
 
-GET    /tickets?status=&product=&assignee=&priority=&sla=&q=&cursor=
-POST   /tickets                         (Idempotency-Key required)
-GET    /tickets/:id
-PATCH  /tickets/:id                     (status, priority, category, product)
-POST   /tickets/:id/assign | /escalate | /merge | /reopen
-POST   /tickets/bulk                    (bulk status/assign/tag)
-GET    /tickets/:id/messages   POST /tickets/:id/messages   (public|internal)
-POST   /tickets/:id/attachments/presign
-POST   /tickets/:id/tags       DELETE /tickets/:id/tags/:tagId
-POST   /tickets/:id/lock       DELETE /tickets/:id/lock
-GET    /tickets/:id/audit
+GET    /products?mine=true          POST /products   GET|PATCH /products/:id
+POST   /products/:id/agents         DELETE /products/:id/agents/:userId
+GET    /customers?search=&tier=     POST /customers  GET|PATCH /customers/:id
+POST   /customers/:id/accounts      DELETE /customers/:id/accounts/:accountId
+POST   /customers/:id/merge         { duplicateId }
+GET    /categories?productId=       POST /categories  PATCH|DELETE /categories/:id
+GET    /tags                        POST /tags        DELETE /tags/:id
 
-GET    /macros  POST /macros  POST /tickets/:id/macros/:macroId/apply
+GET    /tickets?status=&priority=&productId=&assignedToUserId=&unassigned=&search=&cursor=
+POST   /tickets                     (Idempotency-Key honoured)
+GET    /tickets/:id
+PATCH  /tickets/:id                 (subject, status, priority, category, team)
+POST   /tickets/:id/assign          { assignedToUserId | null, reason? }
+POST   /tickets/:id/reopen
+POST   /tickets/:id/tags            DELETE /tickets/:id/tags/:tagId
+POST   /tickets/:id/watch           DELETE /tickets/:id/watch
+GET    /tickets/:id/assignments     (reassignment history)
+GET    /tickets/:id/messages        POST /tickets/:id/messages  { body, visibility }
+GET    /tickets/:id/attachments     POST /tickets/:id/attachments/upload-url
+PUT    /attachments/:id/content     (local backend only)
+POST   /attachments/:id/confirm     GET /attachments/:id/download
+DELETE /attachments/:id
+GET    /notifications               POST /notifications/read-all
+PATCH  /notifications/:id/read      GET|PUT /notifications/preferences
+
+GET    /macros  POST /macros  PATCH|DELETE /macros/:id
+POST   /macros/:id/apply/:ticketId   (changes fields, returns text — sends nothing)
 
 GET    /sla-policies  POST /sla-policies  PATCH /sla-policies/:id
 GET    /business-hours  PUT /business-hours/:id
@@ -351,8 +371,11 @@ GET    /surveys/:token            POST /surveys/:token   (public, unauthenticate
 GET    /reports/overview | /sla | /agents | /csat | /volume
 GET    /notifications  PATCH /notifications/:id/read  PUT /notification-preferences
 
-POST   /webhooks/resend/inbound   (Resend signature verified, no auth)
+POST   /webhooks/resend/inbound   (Svix-signed, unauthenticated, mounted ahead of
+                                   the rate limiter so a spike of customer email
+                                   is never throttled)
 POST   /webhooks/resend/events
+GET    /email/inbound/unprocessed POST /email/inbound/:id/reprocess
 GET    /webhook-subscriptions  POST /webhook-subscriptions
 GET    /audit-logs?entity=&actor=&from=&to=
 GET    /api-keys  POST /api-keys  DELETE /api-keys/:id
@@ -383,10 +406,13 @@ stable machine `code` from a single enum, never a raw driver message.
 
 ## 6. Cross-cutting rules
 
-- **Product scoping is not optional.** Every list query filters by the
-  products the actor's role grants. A tier-1 agent on Product A cannot read
-  Product B's tickets. Enforced in the repository layer signature (every
-  ticket query takes a `productScope`), not left to callers.
+- **Product scoping is not optional.** Every ticket read takes an explicit scope
+  argument, so an omitted scope is a type error rather than a silent leak. `null` means
+  unrestricted (administrators); an empty array matches nothing.
+- **Message visibility is the highest-stakes flag in the system.** A `public` message is
+  emailed to the customer, an `internal` note never leaves. `visibility` is a required
+  field with no default — defaulting it wrong would send a private note to a customer —
+  and tests assert that an internal note produces no outbound mail at all.
 - **Correlation IDs.** `x-request-id` (or generated) is put in
   `AsyncLocalStorage` at the edge; every Winston line, DB slow-query log, and
   queued job inherits it, so an email bounce three hops later traces back to
@@ -487,10 +513,49 @@ Deviations from the original plan, all deliberate:
   key unless `EMAIL_TRANSPORT=log` is set on purpose.
 - **`lib/jwt`** wraps `jose`, keeping token mechanics out of the auth service.
 
-**Phase 3 — ticketing core**
-product, customer, ticket, message, attachment, category, tag, macro,
-notification, email (outbound + inbound). Ends with: a customer emails
-support and an agent replies from the API, threaded correctly.
+**Phase 3 — ticketing core** — _complete_
+product, customer, category, tag, ticket, message, attachment, macro, notification and
+email (outbound replies + the inbound pipeline). 18 more tables, 46 more endpoints.
+
+Verified end to end: a customer emails `wallet@support…`, a ticket opens against the right
+product with the customer created from the address, an agent replies, and the customer's
+response threads back onto the same ticket rather than opening a second one.
+
+Decisions worth knowing:
+
+- **Per-agent product access**, as chosen: `user_products` plus a scope argument threaded
+  through every ticket read. An empty grant list means _nothing_, not everything — there is
+  a test for exactly that, because getting it backwards would expose every product.
+- **Inbound email is a two-step contract.** Resend's `email.received` webhook carries
+  **metadata only** — no body, no headers — so the pipeline persists the envelope, answers
+  202 immediately, and then fetches the body from `GET /emails/receiving/{id}`. The
+  `inbound_emails` row is the durable queue: if processing dies the email is still there,
+  and `POST /email/inbound/:id/reprocess` retries it. Phase 4 turns that into a job.
+- **Threading** works on `In-Reply-To`/`References` first (exact, matched against the
+  Message-ID we sent), then falls back to the reference in the subject line — which is why
+  the reference is in the subject at all.
+- **Unroutable mail is parked, never guessed.** An inbound email whose recipient matches no
+  product's `supportEmail`, with no `DEFAULT_PRODUCT_CODE` fallback, stays `failed`. Filing
+  it under an arbitrary product would hide a customer's problem from the only agents who
+  could act on it.
+- **Auto-replies and bounces are dropped** before they can open tickets or start a loop of
+  robots answering each other.
+- **Attachments have one client flow across two backends.** With object storage configured
+  the client gets a presigned PUT and the bytes never touch the API; without it, the same
+  flow points at `PUT /attachments/:id/content` and files land on local disk. Uploads are
+  recorded as `skipped`, not `clean` — nothing has scanned them yet, and saying otherwise
+  would be a lie the console displays.
+- **Macros never send.** Applying one changes the ticket's fields and returns rendered
+  reply text for the agent to review, so a mis-click is recoverable.
+- **Customers are acknowledged on arrival.** A ticket raised by email, web form or a
+  product system emails the customer their reference immediately, quoting their own words
+  back so they can tell which query it is. Agent-raised tickets are excluded: the customer
+  has just been given the reference on the phone. The acknowledgement's `Message-ID` is
+  recorded against the ticket as an internal system entry, so a reply to _that_ email
+  threads by header even if the customer's client rewrites the subject — which also means
+  threading works on their first reply, not only after an agent has answered. Sending is
+  after commit and swallows its own errors: a mail outage must not cost a saved ticket.
+  Switchable with `SEND_TICKET_ACKNOWLEDGEMENT`.
 
 **Phase 4 — routing & SLA**
 routing, sla, business hours, escalation, the pg-boss cron surface. Ends with:

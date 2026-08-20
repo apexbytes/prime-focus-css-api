@@ -116,6 +116,59 @@ export function loginOtpEmail(input: {
   };
 }
 
+/**
+ * Confirms to a customer that their query is now tracked.
+ *
+ * Leads with the reference, because that is the one thing they may need to quote
+ * back, and echoes their own words so they can see *which* query this is when
+ * they have raised more than one.
+ */
+export function ticketAcknowledgementEmail(input: {
+  fullName: string;
+  reference: string;
+  subject: string;
+  productName: string;
+  body: string;
+}): RenderedEmail {
+  // The customer wrote this text; it is echoed back, so it must be escaped.
+  const excerpt = input.body.length > 600 ? `${input.body.slice(0, 600).trimEnd()}…` : input.body;
+
+  const heading = 'We have received your query';
+  const html = layout(
+    heading,
+    `<p style="margin:0 0 12px;">Hello ${escapeHtml(input.fullName)},</p>
+     <p style="margin:0 0 12px;">Thank you for contacting Prime Focus Support about
+       <strong>${escapeHtml(input.productName)}</strong>. Your query is now being tracked and a member of
+       our team will be in touch.</p>
+     <p style="margin:0 0 20px;padding:12px 16px;background:#f5f6f8;border-radius:6px;">
+       Your reference is <strong style="font-family:ui-monospace,SFMono-Regular,Menlo,monospace;">${escapeHtml(input.reference)}</strong>
+     </p>
+     <p style="margin:0 0 6px;font-size:13px;color:#6b7280;">What you sent us:</p>
+     <blockquote style="margin:0 0 16px;padding:0 0 0 12px;border-left:3px solid #e4e7ec;color:#4b5563;white-space:pre-wrap;">${escapeHtml(excerpt)}</blockquote>
+     <p style="margin:0;">You can reply to this email to add anything further — it will be added to the
+       same query, so there is no need to start a new one.</p>`,
+  );
+
+  return {
+    subject: `[${input.reference}] We have received your query`,
+    html,
+    text: [
+      `Hello ${input.fullName},`,
+      '',
+      `Thank you for contacting Prime Focus Support about ${input.productName}.`,
+      'Your query is now being tracked and a member of our team will be in touch.',
+      '',
+      `Your reference is ${input.reference}`,
+      '',
+      'What you sent us:',
+      excerpt,
+      '',
+      'You can reply to this email to add anything further — it will be added to the same',
+      'query, so there is no need to start a new one.',
+    ].join('\n'),
+  };
+}
+
 export function passwordResetEmail(input: {
   fullName: string;
   resetUrl: string;

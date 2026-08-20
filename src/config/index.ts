@@ -4,6 +4,7 @@ export {
   parseEnv,
   corsOrigins,
   emailTransport,
+  storageBackend,
   isDevelopment,
   isProduction,
   isTest,

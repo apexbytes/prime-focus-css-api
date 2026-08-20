@@ -117,3 +117,30 @@ export async function signIn(
 export function bearer(token: string): [string, string] {
   return ['authorization', `Bearer ${token}`];
 }
+
+// -- phase 3 helpers ----------------------------------------------------------
+
+/** Grants an agent access to a product, by product code. */
+export async function grantProduct(userId: string, productCode: string): Promise<string> {
+  const { products, userProducts } = await import('../../src/modules/product/product.model.js');
+  const { eq: equals } = await import('drizzle-orm');
+
+  const [product] = await db
+    .select()
+    .from(products)
+    .where(equals(products.code, productCode))
+    .limit(1);
+  if (!product) throw new Error(`product ${productCode} not seeded`);
+
+  await db.insert(userProducts).values({ userId, productId: product.id }).onConflictDoNothing();
+  return product.id;
+}
+
+export async function productIdFor(code: string): Promise<string> {
+  const { products } = await import('../../src/modules/product/product.model.js');
+  const { eq: equals } = await import('drizzle-orm');
+
+  const [product] = await db.select().from(products).where(equals(products.code, code)).limit(1);
+  if (!product) throw new Error(`product ${code} not seeded`);
+  return product.id;
+}

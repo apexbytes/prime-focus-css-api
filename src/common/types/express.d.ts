@@ -7,6 +7,11 @@ declare global {
       startedAt: number;
       /** Set by the authenticate middleware; absent on public routes. */
       actor?: import('./actor.js').Actor;
+      /**
+       * Unparsed request body, captured by express.json's verify hook. Needed to
+       * check webhook signatures, which cover the exact bytes sent.
+       */
+      rawBody?: Buffer;
     }
   }
 }
