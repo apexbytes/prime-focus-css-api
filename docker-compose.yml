@@ -1,0 +1,26 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: prime-focus-css-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: css
+      POSTGRES_PASSWORD: css
+      POSTGRES_DB: prime_focus_css
+      # Deterministic ordering and timestamps regardless of the host locale.
+      POSTGRES_INITDB_ARGS: '--encoding=UTF8 --locale=C'
+      TZ: UTC
+    ports:
+      # 5434 on the host: 5432/5433 are commonly already taken by a local
+      # Postgres or another project. Container-internal port is unchanged.
+      - '5434:5432'
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U css -d prime_focus_css']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  postgres-data:

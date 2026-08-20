@@ -1,0 +1,7 @@
+dist
+coverage
+node_modules
+drizzle/**/*.sql
+drizzle/meta
+package-lock.json
+.idea
