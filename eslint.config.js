@@ -124,7 +124,7 @@ export default tseslint.config(
         },
         {
           type: 'module-shared',
-          pattern: 'src/modules/*/*.{schema,types,events,policy,mapper}.ts',
+          pattern: 'src/modules/*/*.{schema,types,events,policy,mapper,status}.ts',
           mode: 'file',
           capture: ['module'],
         },
@@ -160,8 +160,10 @@ export default tseslint.config(
               allow: allow(
                 anyOf('config', 'common'),
                 // Route files wire middleware, including another module's
-                // authenticate/authorize exposed through its barrel.
-                anyOf('module-index', 'module-middleware'),
+                // authenticate/authorize exposed through its barrel, and mount
+                // another module's router as a nested resource
+                // (/tickets/:id/messages).
+                anyOf('module-index', 'module-middleware', 'module-routes'),
                 own('module-controller'),
                 own('module-shared'),
               ),

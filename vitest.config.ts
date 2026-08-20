@@ -13,6 +13,9 @@ export default defineConfig({
       // Flow specs drive many logins from one IP; rateLimit.test.ts covers the
       // limiter itself with its own budget.
       AUTH_RATE_LIMIT_MAX: '5000',
+      // Inbound webhook tests sign their requests for real, so the secret has to
+      // be present at boot.
+      RESEND_WEBHOOK_SECRET: 'whsec_dGVzdC13ZWJob29rLXNpZ25pbmcta2V5LTEyMw==',
       RATE_LIMIT_MAX: '100000',
     },
     coverage: {

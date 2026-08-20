@@ -21,6 +21,10 @@ yarn-error.log*
 /logs
 *.log
 
+# local attachment storage — real customer documents land here when no object
+# store is configured, so it must never be committable
+/storage
+
 # test / tooling caches
 /coverage
 .eslintcache

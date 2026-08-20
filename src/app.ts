@@ -10,6 +10,7 @@ import {
   notFound,
   requestLogger,
 } from './common/middleware/index.js';
+import { emailWebhookRouter } from './modules/email/index.js';
 import { healthRouter } from './modules/health/index.js';
 import { v1Router } from './routes/v1.js';
 
@@ -45,8 +46,24 @@ export function createApp(): Express {
   app.use(correlationId);
   app.use(requestLogger);
 
-  app.use(express.json({ limit: env.BODY_LIMIT }));
+  app.use(
+    express.json({
+      limit: env.BODY_LIMIT,
+      // Webhook signatures cover the bytes as sent, so the raw buffer has to
+      // survive parsing.
+      verify: (req, _res, buffer) => {
+        (req as express.Request).rawBody = Buffer.from(buffer);
+      },
+    }),
+  );
   app.use(express.urlencoded({ extended: false, limit: env.BODY_LIMIT }));
+
+  /**
+   * Provider webhooks mount ahead of the rate limiter: they are authenticated by
+   * signature rather than by a token, and throttling them would mean dropping
+   * customer email during exactly the spike support most needs to see.
+   */
+  app.use(`${API_PREFIX}/webhooks/resend`, emailWebhookRouter);
 
   app.use(globalRateLimit);
 

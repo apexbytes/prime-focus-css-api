@@ -87,6 +87,46 @@ export const envSchema = z.object({
    */
   EMAIL_TRANSPORT: z.enum(['resend', 'log']).optional(),
 
+  // ---- tickets -------------------------------------------------------------
+  /** Leading segment of a ticket reference, e.g. `PF` in PF-2026-000123. */
+  TICKET_REFERENCE_PREFIX: z.string().min(1).max(8).default('PF'),
+  /**
+   * Emails the customer a reference when their query is logged. On by default:
+   * without it, a customer who emails support gets silence until an agent
+   * happens to reply.
+   */
+  SEND_TICKET_ACKNOWLEDGEMENT: booleanish.default(true),
+
+  // ---- inbound email -------------------------------------------------------
+  /** Svix signing secret from the Resend webhook page. Required to accept inbound mail. */
+  RESEND_WEBHOOK_SECRET: z.string().min(1).optional(),
+  /** Domain the support addresses live on, e.g. support.primefocus.co.zw. */
+  SUPPORT_INBOX_DOMAIN: z.string().min(1).default('support.primefocus.co.zw'),
+  /**
+   * Product an inbound email falls back to when its recipient address matches no
+   * product. Without it, unroutable mail is parked as `failed` rather than
+   * silently filed under the wrong product.
+   */
+  DEFAULT_PRODUCT_CODE: z.string().min(1).optional(),
+
+  // ---- attachment storage --------------------------------------------------
+  /** Derived from credentials when unset: `s3` if a bucket is configured, else `local`. */
+  STORAGE_BACKEND: z.enum(['local', 's3']).optional(),
+  STORAGE_LOCAL_DIR: z.string().min(1).default('storage'),
+  STORAGE_ENDPOINT: z.string().min(1).optional(),
+  STORAGE_REGION: z.string().min(1).default('auto'),
+  STORAGE_BUCKET: z.string().min(1).optional(),
+  STORAGE_ACCESS_KEY_ID: z.string().min(1).optional(),
+  STORAGE_SECRET_ACCESS_KEY: z.string().min(1).optional(),
+  /** Required by most S3-compatible providers that are not AWS. */
+  STORAGE_FORCE_PATH_STYLE: booleanish.default(true),
+  ATTACHMENT_MAX_BYTES: z.coerce
+    .number()
+    .int()
+    .min(1024)
+    .default(25 * 1024 * 1024),
+  UPLOAD_URL_TTL_SECONDS: z.coerce.number().int().min(60).max(3600).default(900),
+
   // ---- seed ----------------------------------------------------------------
   SEED_ADMIN_EMAIL: z.string().min(3).default('admin@primefocus.co.zw'),
   SEED_ADMIN_NAME: z.string().min(1).default('Prime Focus Administrator'),
@@ -120,6 +160,23 @@ const productionSchema = envSchema.superRefine((value, ctx) => {
       path: ['RESEND_API_KEY'],
       message:
         'is required in production (or set EMAIL_TRANSPORT=log to send nothing deliberately)',
+    });
+  }
+
+  if (!value.RESEND_WEBHOOK_SECRET) {
+    ctx.addIssue({
+      code: 'custom',
+      path: ['RESEND_WEBHOOK_SECRET'],
+      message: 'is required in production to verify inbound email webhooks',
+    });
+  }
+
+  if ((value.STORAGE_BACKEND ?? 'local') === 'local') {
+    ctx.addIssue({
+      code: 'custom',
+      path: ['STORAGE_BUCKET'],
+      message:
+        'object storage must be configured in production; local disk does not survive a redeploy',
     });
   }
 
@@ -162,3 +219,13 @@ export const corsOrigins: string[] | '*' =
 /** `resend` when a key is configured, otherwise `log`. */
 export const emailTransport: 'resend' | 'log' =
   env.EMAIL_TRANSPORT ?? (env.RESEND_API_KEY ? 'resend' : 'log');
+
+/**
+ * `s3` once a bucket and credentials exist, otherwise the local-disk backend so
+ * development and tests need no cloud account. Same upload flow either way.
+ */
+export const storageBackend: 'local' | 's3' =
+  env.STORAGE_BACKEND ??
+  (env.STORAGE_BUCKET && env.STORAGE_ACCESS_KEY_ID && env.STORAGE_SECRET_ACCESS_KEY
+    ? 's3'
+    : 'local');

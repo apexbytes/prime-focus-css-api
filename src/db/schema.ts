@@ -20,7 +20,18 @@ export * from '../modules/team/team.model.js';
 export * from '../modules/api-key/api-key.model.js';
 export * from '../modules/audit/audit.model.js';
 
+// -- phase 3: products, customers & ticketing ---------------------------------
+export * from '../modules/product/product.model.js';
+export * from '../modules/customer/customer.model.js';
+export * from '../modules/category/category.model.js';
+export * from '../modules/ticket/ticket.model.js';
+export * from '../modules/tag/tag.model.js';
+export * from '../modules/message/message.model.js';
+export * from '../modules/attachment/attachment.model.js';
+export * from '../modules/macro/macro.model.js';
+export * from '../modules/email/email.model.js';
+export * from '../modules/notification/notification.model.js';
+
 // -- modules ------------------------------------------------------------------
-// Phase 3: product, customer, ticket, message, attachment, category, tag, macro
 // Phase 4: sla, escalation, routing
 // Phase 5: knowledge-base, survey, report
