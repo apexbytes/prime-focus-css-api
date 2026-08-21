@@ -123,12 +123,21 @@ export default tseslint.config(
           capture: ['module'],
         },
         {
+          // The websocket protocol: the socket-side twin of a routes file, and
+          // subject to the same rule — wiring only, with the domain logic in a
+          // service.
+          type: 'module-gateway',
+          pattern: 'src/modules/*/*.gateway.ts',
+          mode: 'file',
+          capture: ['module'],
+        },
+        {
           type: 'module-shared',
           // Pure, dependency-light logic a module wants to unit test on its own:
           // the ticket state machine, the SLA clock, the routing scorer, the
           // knowledge base's query builder, the retention cutoffs.
           pattern:
-            'src/modules/*/*.{schema,types,events,policy,mapper,status,clock,scoring,search,range,retention}.ts',
+            'src/modules/*/*.{schema,types,events,policy,mapper,status,clock,scoring,search,range,retention,signature}.ts',
           mode: 'file',
           capture: ['module'],
         },
@@ -170,6 +179,14 @@ export default tseslint.config(
                 anyOf('module-index', 'module-middleware', 'module-routes'),
                 own('module-controller'),
                 own('module-shared'),
+              ),
+            },
+            {
+              from: el('module-gateway'),
+              allow: allow(
+                anyOf('config', 'common', 'lib', 'db', 'module-service'),
+                own('module-shared'),
+                own('module-service'),
               ),
             },
             {
@@ -241,6 +258,7 @@ export default tseslint.config(
                 own('module-service'),
                 own('module-jobs'),
                 own('module-middleware'),
+                own('module-gateway'),
                 own('module-shared'),
                 own('module-model'),
               ),

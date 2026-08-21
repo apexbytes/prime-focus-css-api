@@ -1,7 +1,9 @@
+import { createHash } from 'node:crypto';
 import { AppError } from '../../common/errors/index.js';
 import { isUserActor, type Actor } from '../../common/types/actor.js';
 import { env } from '../../config/index.js';
 import { withTransaction } from '../../db/transaction.js';
+import { forgetPrefix, remember } from '../../lib/cache/index.js';
 import { createModuleLogger } from '../../lib/logger/index.js';
 import * as auditService from '../audit/audit.service.js';
 import * as categoryService from '../category/category.service.js';
@@ -179,15 +181,55 @@ export async function suggest(
   const query = toSuggestQuery(input);
   if (!query) return [];
 
-  const hits = await repository.search(query, {
+  const options = {
     productIds: await scopedProductIds(actor),
     productId: input.productId,
     includeInternal: false,
     limit: input.limit ?? env.KB_SUGGEST_LIMIT,
-  });
+  };
 
+  /**
+   * Cached, because the ticket form calls this on every keystroke pause and a
+   * ranked full-text query over the whole knowledge base is not free.
+   *
+   * The scope is part of the key — an agent restricted to one product and an
+   * administrator typing the same words must not share a result list — and the
+   * TTL is a minute, so an article unpublished for being wrong stops being
+   * offered within one. A write to any article drops the whole prefix, because
+   * a suggestion cache is keyed by the customer's words and there is no way to
+   * know which of them matched.
+   */
+  const hits = await remember(
+    suggestCacheKey(query, options),
+    env.KB_SUGGEST_CACHE_TTL_SECONDS,
+    () => repository.search(query, options),
+  );
+
+  // Outside the cache: a result list is an impression whether or not it was
+  // recomputed, and caching the counter would lose most of them.
   await recordViews(hits, 'suggest', actor, input.ticketId);
   return hits;
+}
+
+/** Prefix for everything this cache writes, so one call can drop all of it. */
+const SUGGEST_CACHE_PREFIX = 'kb:suggest:';
+
+function suggestCacheKey(
+  query: string,
+  options: { productIds: string[] | null; productId?: string | undefined; limit: number },
+): string {
+  const scope = createHash('sha256')
+    .update(
+      JSON.stringify([
+        query,
+        options.productIds === null ? 'all' : [...options.productIds].sort(),
+        options.productId ?? null,
+        options.limit,
+      ]),
+    )
+    .digest('base64url');
+
+  return `${SUGGEST_CACHE_PREFIX}${scope}`;
 }
 
 /**
@@ -273,6 +315,8 @@ export async function create(
 
     return row;
   });
+
+  await invalidateSuggestions();
 
   log.info('kb article created', { articleId: article.id, slug: article.slug });
   return (await repository.findById(article.id)) as ArticleView;
@@ -373,6 +417,8 @@ export async function update(
     );
   });
 
+  await invalidateSuggestions();
+
   return (await repository.findById(id)) as ArticleView;
 }
 
@@ -425,6 +471,8 @@ export async function publish(id: string, actor: Actor): Promise<ArticleView> {
       tx,
     );
   });
+
+  await invalidateSuggestions();
 
   log.info('kb article published', {
     articleId: id,
@@ -557,4 +605,18 @@ export async function listRevisions(
 /** Article counts by status, for the reporting overview. */
 export function countByStatus() {
   return repository.countByStatus();
+}
+
+/**
+ * Drops every cached suggestion.
+ *
+ * The whole prefix rather than the entries that mention this article: the cache
+ * is keyed by what a customer typed, and there is no way to know from an article
+ * id which of those queries it ranked in. The alternative — waiting out the TTL
+ * — would leave a just-unpublished article being offered to customers for
+ * another minute, and it is unpublished precisely because somebody decided it
+ * should stop being offered.
+ */
+async function invalidateSuggestions(): Promise<void> {
+  await forgetPrefix(SUGGEST_CACHE_PREFIX);
 }

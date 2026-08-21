@@ -8,6 +8,8 @@ import * as auditService from '../audit/audit.service.js';
 import * as categoryService from '../category/category.service.js';
 import * as customerService from '../customer/customer.service.js';
 import * as emailService from '../email/email.service.js';
+import * as eventService from '../event/event.service.js';
+import { DOMAIN_EVENT } from '../event/event.types.js';
 // Cyclic with message.service by design (see the note in user.service): a ticket
 // and its opening message must commit together, and replies need the ticket.
 import * as messageService from '../message/message.service.js';
@@ -207,6 +209,11 @@ export async function create(
     );
 
     afterCommit(async () => {
+      // Announced to the console and to any subscribed product system. After
+      // commit, because there is no way to retract an event about a ticket that
+      // then rolled back.
+      await eventService.publish({ type: DOMAIN_EVENT.ticketCreated, ticket: row });
+
       if (input.assignedToUserId) {
         await notificationService.notifyAssignment(input.assignedToUserId, row);
       }
@@ -358,6 +365,23 @@ export async function updateFields(
       tx,
     );
 
+    // The most specific name wins rather than being emitted alongside a generic
+    // one: a receiver interested only in resolutions subscribes to
+    // `ticket.resolved`, and one interested in every move subscribes to all
+    // three names. Sending both would deliver every resolution twice.
+    afterCommit(async () => {
+      await eventService.publish({
+        type:
+          patch.status === undefined
+            ? DOMAIN_EVENT.ticketUpdated
+            : becameResolved(before.status, row.status)
+              ? DOMAIN_EVENT.ticketResolved
+              : DOMAIN_EVENT.ticketStatusChanged,
+        ticket: row,
+        ...(patch.status === undefined ? {} : { data: { from: before.status, to: row.status } }),
+      });
+    });
+
     // Resolution is what earns the right to ask the customer how it went.
     // Delayed, and re-checked when the job runs: the delay is exactly the
     // window in which a customer replies "that did not work" and reopens it.
@@ -453,6 +477,12 @@ export async function assign(
     );
 
     afterCommit(async () => {
+      await eventService.publish({
+        type: DOMAIN_EVENT.ticketAssigned,
+        ticket: row,
+        data: { from: before.assignedToUserId, to: toUserId, reason: reason ?? null },
+      });
+
       if (toUserId && toUserId !== (isUserActor(actor) ? actor.id : null)) {
         await notificationService.notifyAssignment(toUserId, row);
       }
@@ -484,8 +514,8 @@ export async function reopen(
     });
   }
 
-  await withTransaction(async ({ tx }) => {
-    await repository.update(
+  await withTransaction(async ({ tx, afterCommit }) => {
+    const row = await repository.update(
       id,
       {
         status: 'open',
@@ -495,6 +525,15 @@ export async function reopen(
       },
       tx,
     );
+    if (!row) throw AppError.notFound('Ticket not found');
+
+    afterCommit(async () => {
+      await eventService.publish({
+        type: DOMAIN_EVENT.ticketReopened,
+        ticket: row,
+        data: { from: before.status, reason: reason ?? null },
+      });
+    });
 
     // A reopened ticket owes a fresh resolution, measured from now. The first
     // response already happened, so that clock stays satisfied.

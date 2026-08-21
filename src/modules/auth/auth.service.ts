@@ -346,6 +346,25 @@ export async function actorFromAccessToken(token: string): Promise<UserActor> {
   return toActor(user, verified.claims.sid, await resolvePermissions(user));
 }
 
+/**
+ * Whether a connection authenticated earlier is still allowed to stay open.
+ *
+ * The websocket gateway calls this on a timer. It re-checks the two things that
+ * change underneath a live connection — the account being suspended and the
+ * session being signed out — and deliberately does not re-verify the access
+ * token, which expires every fifteen minutes and would take every connected
+ * agent down with it.
+ */
+export async function isConnectionStillAuthorised(actor: UserActor): Promise<boolean> {
+  const user = await userService.findById(actor.id);
+  if (!user || user.status !== 'active') return false;
+
+  if (!actor.sessionId) return true;
+
+  const session = await repository.findSessionById(actor.sessionId);
+  return Boolean(session && !session.revokedAt);
+}
+
 export async function actorFromApiKey(presented: string): Promise<Actor> {
   const parsed = parseApiKey(presented);
   if (!parsed) throw new AppError(401, ErrorCode.API_KEY_INVALID, 'API key is not valid');

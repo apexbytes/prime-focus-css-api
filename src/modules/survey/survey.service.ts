@@ -6,6 +6,8 @@ import { withTransaction } from '../../db/transaction.js';
 import { createModuleLogger } from '../../lib/logger/index.js';
 import { csatSurveyEmail, sendEmail, webUrl } from '../../lib/resend/index.js';
 import * as auditService from '../audit/audit.service.js';
+import * as eventService from '../event/event.service.js';
+import { DOMAIN_EVENT } from '../event/event.types.js';
 import * as customerService from '../customer/customer.service.js';
 import * as productService from '../product/product.service.js';
 import * as ticketService from '../ticket/ticket.service.js';
@@ -207,7 +209,7 @@ export async function respond(
     throw AppError.conflict('This survey has already been answered');
   }
 
-  await withTransaction(async ({ tx }) => {
+  await withTransaction(async ({ tx, afterCommit }) => {
     const row = await repository.update(
       survey.id,
       {
@@ -218,6 +220,17 @@ export async function respond(
       tx,
     );
     if (!row) throw AppError.notFound('This survey link is not valid');
+
+    // The score, not the comment: a customer's free text about an agent goes to
+    // the people who handle the ticket, not to every system subscribed to the
+    // product. `GET /csat` returns it to staff who hold `report:view`.
+    afterCommit(async () => {
+      await eventService.publishForTicket(DOMAIN_EVENT.csatReceived, survey.ticketId, {
+        surveyId: survey.id,
+        score: input.score,
+        ratedUserId: survey.ratedUserId,
+      });
+    });
 
     await auditService.record(
       {

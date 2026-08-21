@@ -6,7 +6,9 @@ import * as attachmentService from '../attachment/attachment.service.js';
 import * as auditService from '../audit/audit.service.js';
 import * as customerService from '../customer/customer.service.js';
 import * as messageService from '../message/message.service.js';
+import * as realtimeService from '../realtime/realtime.service.js';
 import * as ticketService from '../ticket/ticket.service.js';
+import * as webhookService from '../webhook/webhook.service.js';
 import { cutoffsFor, isCoherent, type RetentionCutoffs } from './retention.policy.js';
 
 const log = createModuleLogger('retention');
@@ -32,6 +34,16 @@ export interface SweepResult {
   messagesAnonymised: number;
   attachmentsDeleted: number;
   customersAnonymised: number;
+  /**
+   * Housekeeping rather than policy. A webhook delivery row is not personal
+   * data the Act has an opinion about — it is a log of what a partner system
+   * was told, reconstructible from the tickets and the audit trail — so it has
+   * its own period in days, swept here because this is the module that already
+   * runs weekly with permission to delete things.
+   */
+  webhookDeliveriesDeleted: number;
+  /** Abandoned ticket locks, cleared in the same pass for the same reason. */
+  ticketLocksReleased: number;
   /** True when the batch limit was reached, so there is more to do next run. */
   moreRemaining: boolean;
 }
@@ -124,6 +136,8 @@ export async function sweep(
       messagesAnonymised: 0,
       attachmentsDeleted: 0,
       customersAnonymised: 0,
+      webhookDeliveriesDeleted: 0,
+      ticketLocksReleased: 0,
       moreRemaining: ticketIds.length === limit,
     };
   }
@@ -138,6 +152,7 @@ export async function sweep(
       entityType: 'retention',
       after: {
         cutoffs,
+        webhookDeliveryDays: env.WEBHOOK_DELIVERY_RETENTION_DAYS,
         auditLogsDeleted: result.auditLogsDeleted,
         ticketsAnonymised: result.ticketsAnonymised,
         messagesAnonymised: result.messagesAnonymised,
@@ -188,6 +203,14 @@ async function enforce(
 
   const auditLogsDeleted = await auditService.purgeOlderThan(cutoffs.auditLogsBefore, limit);
 
+  // Housekeeping, after the policy's own work: neither of these is personal
+  // data, and neither may fail the sweep that matters.
+  const webhookDeliveriesDeleted = await webhookService.purgeDeliveries(
+    daysBefore(env.WEBHOOK_DELIVERY_RETENTION_DAYS),
+    limit,
+  );
+  const ticketLocksReleased = await realtimeService.sweepExpiredLocks();
+
   return {
     dryRun: false,
     cutoffs,
@@ -196,7 +219,18 @@ async function enforce(
     messagesAnonymised,
     attachmentsDeleted,
     customersAnonymised,
+    webhookDeliveriesDeleted,
+    ticketLocksReleased,
     moreRemaining:
-      ticketIds.length === limit || auditLogsDeleted === limit || customersAnonymised === limit,
+      ticketIds.length === limit ||
+      auditLogsDeleted === limit ||
+      customersAnonymised === limit ||
+      webhookDeliveriesDeleted === limit,
   };
+}
+
+const DAY_MS = 86_400_000;
+
+function daysBefore(days: number): Date {
+  return new Date(Date.now() - days * DAY_MS);
 }

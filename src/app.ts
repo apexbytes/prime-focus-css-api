@@ -4,6 +4,7 @@ import express, { type Express } from 'express';
 import helmet from 'helmet';
 import { API_PREFIX, corsOrigins, env } from './config/index.js';
 import {
+  apiKeyRateLimit,
   correlationId,
   errorHandler,
   globalRateLimit,
@@ -14,6 +15,7 @@ import { emailWebhookRouter } from './modules/email/index.js';
 import { healthRouter } from './modules/health/index.js';
 import { v1Router } from './routes/v1.js';
 import { registerJobHandlers } from './workers/index.js';
+import { registerCacheSubscribers } from './workers/subscribers.js';
 
 /**
  * Builds the Express app without binding a port, so tests can drive it with
@@ -31,6 +33,9 @@ export function createApp(): Express {
   // queue has something to dispatch to. Opening the queue itself is server.ts's
   // job, so tests that only build the app never connect to one.
   registerJobHandlers();
+  // Same contract: a name-to-handler map, no connections. `startSignals()` in
+  // server.ts is what opens the Redis subscriber.
+  registerCacheSubscribers();
 
   const app = express();
 
@@ -72,6 +77,9 @@ export function createApp(): Express {
   app.use(`${API_PREFIX}/webhooks/resend`, emailWebhookRouter);
 
   app.use(globalRateLimit);
+  // After the global limiter, not instead of it: a product system is subject to
+  // both, and this one is the budget it was actually sold.
+  app.use(apiKeyRateLimit);
 
   app.use(healthRouter);
   app.use(API_PREFIX, v1Router);

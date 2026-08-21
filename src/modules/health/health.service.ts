@@ -2,6 +2,8 @@ import { env, SERVICE_NAME } from '../../config/index.js';
 import { checkDatabaseConnection } from '../../db/client.js';
 import { checkAntivirus } from '../../lib/antivirus/index.js';
 import { checkQueue } from '../../lib/queue/index.js';
+import { checkRedis } from '../../lib/redis/index.js';
+import { socketHealth } from '../../lib/socket/index.js';
 import { isShuttingDown } from '../../common/utils/lifecycle.js';
 import type { DependencyStatus, LivenessReport, ReadinessReport } from './health.types.js';
 
@@ -59,6 +61,37 @@ async function checkScanner(): Promise<DependencyStatus> {
 }
 
 /**
+ * Redis.
+ *
+ * `not_configured` under the `memory` driver, following the queue's `inline`
+ * and the scanner's `none`. A configured-but-unreachable Redis *does* fail
+ * readiness: rate limits stop being shared and socket rooms stop spanning
+ * instances, and an instance in that state is not fully serving even though
+ * every request still answers.
+ */
+async function checkCache(): Promise<DependencyStatus> {
+  const result = await checkRedis();
+  return {
+    name: 'redis',
+    state: result.state,
+    ...(result.latencyMs !== undefined ? { latencyMs: result.latencyMs } : {}),
+    ...(result.error ? { error: result.error } : {}),
+  };
+}
+
+/**
+ * The websocket server.
+ *
+ * Never fails readiness. Everything it offers is also reachable over REST, so
+ * an instance with no realtime layer serves a console that polls — slower, not
+ * broken — and taking it out of the load balancer would make that worse.
+ */
+function checkRealtime(): DependencyStatus {
+  const result = socketHealth();
+  return { name: 'realtime', state: result.state };
+}
+
+/**
  * Readiness answers "should this instance receive traffic". Dependencies added
  * in later phases register here: Resend still reports `not_configured`.
  *
@@ -71,8 +104,10 @@ export async function getReadiness(): Promise<ReadinessReport> {
     checkDatabase(),
     checkJobQueue(),
     checkScanner(),
+    checkCache(),
   ]);
 
+  dependencies.push(checkRealtime());
   dependencies.push({ name: 'resend', state: 'not_configured' });
 
   const draining = isShuttingDown();

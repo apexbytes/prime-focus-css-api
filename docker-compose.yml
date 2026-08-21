@@ -22,5 +22,23 @@ services:
       timeout: 5s
       retries: 10
 
+  redis:
+    image: redis:7-alpine
+    container_name: prime-focus-css-cache
+    restart: unless-stopped
+    # Rate-limit counters and cached lookups are all reconstructible, so there
+    # is no volume: a restart costs a cold cache and nothing else. The socket
+    # adapter's rooms are re-established by clients reconnecting.
+    command: ['redis-server', '--save', '', '--appendonly', 'no']
+    ports:
+      # 6381 on the host, following the database's 5434: 6379 is commonly
+      # already taken. Container-internal port is unchanged.
+      - '6381:6379'
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
 volumes:
   postgres-data:

@@ -4,6 +4,8 @@ import { env } from '../../config/index.js';
 import { withTransaction } from '../../db/transaction.js';
 import { createModuleLogger } from '../../lib/logger/index.js';
 import * as auditService from '../audit/audit.service.js';
+import * as eventService from '../event/event.service.js';
+import { DOMAIN_EVENT } from '../event/event.types.js';
 import * as notificationService from '../notification/notification.service.js';
 import * as productService from '../product/product.service.js';
 import * as slaService from '../sla/sla.service.js';
@@ -302,6 +304,18 @@ async function applyRule(
   if (!claimed) return false;
 
   await carryOut(rule, entry, reason);
+
+  // After the rung's side effects, not before: an event saying a ticket was
+  // reassigned should not arrive ahead of the reassignment. The ladder is
+  // already claimed at this point, so a failure here cannot cause a re-run.
+  await eventService.publishForTicket(DOMAIN_EVENT.ticketEscalated, entry.ticketId, {
+    ruleId: rule.id,
+    ruleName: rule.name,
+    thresholdPercent: rule.thresholdPercent,
+    action: rule.action,
+    consumedPercent,
+    reason,
+  });
 
   log.warn('ticket escalated', {
     ticketId: entry.ticketId,

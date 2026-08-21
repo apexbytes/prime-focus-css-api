@@ -45,3 +45,7 @@ export * from '../modules/survey/survey.model.js';
 // The materialised views themselves are declared `.existing()` and their DDL
 // lives in the migration by hand; only `report_refreshes` is a real table here.
 export * from '../modules/report/report.model.js';
+
+// -- phase 6: realtime & scale ------------------------------------------------
+export * from '../modules/realtime/realtime.model.js';
+export * from '../modules/webhook/webhook.model.js';

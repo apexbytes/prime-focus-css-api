@@ -9,7 +9,7 @@ function app(limit: number, skipOperational = false): Express {
   const instance = express();
   instance.set('trust proxy', 1);
   instance.use(correlationId);
-  instance.use(createRateLimiter({ windowMs: 60_000, limit, skipOperational }));
+  instance.use(createRateLimiter({ name: 'test', windowMs: 60_000, limit, skipOperational }));
   instance.get('/healthz', (_req, res) => res.json({ ok: true }));
   instance.get('/thing', (_req, res) => res.json({ ok: true }));
   instance.use(errorHandler);

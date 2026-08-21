@@ -2,9 +2,12 @@ import { AppError } from '../../common/errors/index.js';
 import type { Actor } from '../../common/types/actor.js';
 import { env } from '../../config/index.js';
 import { withTransaction, type Executor } from '../../db/transaction.js';
+import { publishSignal, SIGNAL } from '../../lib/cache/index.js';
 import { createModuleLogger } from '../../lib/logger/index.js';
 import { enqueue, JOB } from '../../lib/queue/index.js';
 import * as auditService from '../audit/audit.service.js';
+import * as eventService from '../event/event.service.js';
+import { DOMAIN_EVENT } from '../event/event.types.js';
 import * as notificationService from '../notification/notification.service.js';
 import * as productService from '../product/product.service.js';
 // From the shared status file, not the ticket barrel: the barrel pulls in
@@ -38,7 +41,14 @@ const log = createModuleLogger('sla');
 const CACHE_TTL_MS = 60_000;
 const calendarCache = new Map<string, { calendar: BusinessCalendar; expiresAt: number }>();
 
+/** Clears this process's copy and tells the others. */
 export function invalidateCalendarCache(id?: string): void {
+  onCalendarInvalidation(id);
+  void publishSignal(SIGNAL.calendars, id);
+}
+
+/** The local half, and what the signal subscriber calls. */
+export function onCalendarInvalidation(id?: string): void {
   if (id) {
     calendarCache.delete(id);
     return;
@@ -641,6 +651,13 @@ async function recordBreach(entry: DueTarget, now: Date): Promise<void> {
     );
 
     afterCommit(async () => {
+      await eventService.publishForTicket(DOMAIN_EVENT.slaBreached, entry.ticketId, {
+        kind: current.kind,
+        dueAt: current.dueAt,
+        breachedAt: now,
+        minutesOverdue,
+      });
+
       if (!entry.assignedToUserId) return;
 
       await notificationService.notifySlaBreach(entry.assignedToUserId, {
