@@ -13,6 +13,7 @@ import {
 import { emailWebhookRouter } from './modules/email/index.js';
 import { healthRouter } from './modules/health/index.js';
 import { v1Router } from './routes/v1.js';
+import { registerJobHandlers } from './workers/index.js';
 
 /**
  * Builds the Express app without binding a port, so tests can drive it with
@@ -26,6 +27,11 @@ import { v1Router } from './routes/v1.js';
  *   5. notFound, then errorHandler — always last
  */
 export function createApp(): Express {
+  // Pure bookkeeping (see workers/index.ts): maps job names to handlers so the
+  // queue has something to dispatch to. Opening the queue itself is server.ts's
+  // job, so tests that only build the app never connect to one.
+  registerJobHandlers();
+
   const app = express();
 
   // Behind nginx/an ALB: needed for correct client IPs in logs and rate limits.

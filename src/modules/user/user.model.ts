@@ -9,6 +9,14 @@ import { roles } from '../role/role.model.js';
  */
 export const userStatus = pgEnum('user_status', ['invited', 'active', 'suspended']);
 
+/**
+ * Whether an agent is at their desk. Distinct from `status`, which is an
+ * administrative fact about the account: a suspended agent is not coming back,
+ * an `away` one is at lunch. Routing assigns to `online` agents only, unless
+ * `ROUTING_ASSIGN_TO_AWAY_AGENTS` says otherwise.
+ */
+export const agentAvailability = pgEnum('agent_availability', ['online', 'away', 'offline']);
+
 export const users = pgTable(
   'users',
   {
@@ -29,6 +37,17 @@ export const users = pgTable(
     lastLoginAt: instant('last_login_at'),
     failedLoginAttempts: integer('failed_login_attempts').notNull().default(0),
     lockedUntil: instant('locked_until'),
+    /**
+     * Routing state, added in Phase 4. `offline` by default: a newly invited
+     * agent should not be handed work before they have ever signed in.
+     */
+    availability: agentAvailability('availability').notNull().default('offline'),
+    /**
+     * Open tickets this agent may hold before routing stops choosing them. Null
+     * falls back to `DEFAULT_AGENT_MAX_OPEN_TICKETS`, so raising the default does
+     * not mean rewriting every row.
+     */
+    maxOpenTickets: integer('max_open_tickets'),
     /** Set instead of deleting: audit trails must keep resolving the actor. */
     deletedAt: instant('deleted_at'),
     ...timestamps,
@@ -39,3 +58,4 @@ export const users = pgTable(
 export type UserRow = typeof users.$inferSelect;
 export type NewUser = typeof users.$inferInsert;
 export type UserStatus = (typeof userStatus.enumValues)[number];
+export type AgentAvailability = (typeof agentAvailability.enumValues)[number];

@@ -1,4 +1,4 @@
-import type { UserRow, UserStatus } from './user.model.js';
+import type { AgentAvailability, UserRow, UserStatus } from './user.model.js';
 
 /** Safe projection: never includes the password hash. */
 export interface PublicUser {
@@ -12,6 +12,10 @@ export interface PublicUser {
   roleName: string;
   lastLoginAt: Date | null;
   createdAt: Date;
+  /** Routing state, added in Phase 4. */
+  availability: AgentAvailability;
+  /** Null means the system default applies. */
+  maxOpenTickets: number | null;
 }
 
 export interface UserWithRole extends UserRow {
@@ -27,4 +31,4 @@ export interface ListUsersFilter {
   cursor?: string;
 }
 
-export type { UserRow, UserStatus };
+export type { AgentAvailability, UserRow, UserStatus };

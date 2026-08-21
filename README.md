@@ -134,6 +134,102 @@ to `PUT` the bytes: a presigned URL when object storage is configured (`STORAGE_
 credentials), otherwise an API URL that writes to `./storage`. Local files are gitignored —
 they are real customer documents.
 
+## Service levels, routing and escalation
+
+Every ticket gets two deadlines when it is raised — a first response and a
+resolution — from the SLA policy for its **product × priority**. The clock counts
+**working time only**, against a business-hours calendar with Zimbabwe's public
+holidays on it, so an hour's target on a ticket that arrives at 16:40 on Friday
+falls on Monday morning rather than Friday evening.
+
+```bash
+# where a ticket's clocks stand
+curl -s localhost:3000/api/v1/tickets/$ID/sla -H "authorization: Bearer $TOKEN"
+
+# the working week and the holidays on it
+curl -s localhost:3000/api/v1/business-hours -H "authorization: Bearer $TOKEN"
+```
+
+The clock **stops** while a ticket is `pending` or `on_hold` — waiting on the
+customer is not time we owe them — and the deadline is pushed out by the working
+time the pause actually cost when it restarts. A pause over a weekend costs
+nothing. Replying satisfies the first-response clock; resolving satisfies the
+other; reopening starts a fresh resolution clock.
+
+Editing a policy never moves a deadline that already exists: `target_minutes` is
+copied onto the ticket's target when it is created, so an agent's afternoon
+cannot be rewritten under them by a configuration change.
+
+**Assignment is automatic.** `routing_rules` are matched in `sortOrder`, first
+match wins, and every criterion is optional — a rule with no criteria at all is
+the catch-all at the bottom of the list. The matched rule names a team and,
+optionally, a required skill; the engine then picks the least loaded eligible
+agent, comparing load as a share of _each agent's own_ capacity so a part-timer
+is not handed work until they are as busy as a full-timer. Ties break on skill,
+then on least-recently-assigned, which is what makes the fallback a real round
+robin.
+
+Nobody eligible is a normal outcome, not a failure: the ticket stays in the
+unassigned queue, visible to everyone who works the product. Availability and
+capacity are never relaxed to find someone — an offline or over-capacity agent is
+a worse home for a customer's problem than an open queue.
+
+```bash
+# an agent marks themselves at their desk; routing only picks `online` agents
+curl -sX PATCH localhost:3000/api/v1/users/me/availability \
+  -H "authorization: Bearer $TOKEN" -H 'content-type: application/json' \
+  -d '{"availability":"online"}'
+
+# why this ticket landed where it did, without changing anything
+curl -s localhost:3000/api/v1/tickets/$ID/routing -H "authorization: Bearer $TOKEN"
+```
+
+Turn push assignment off entirely with `AUTO_ASSIGN_ENABLED=false`.
+
+**Breaches escalate on their own.** A cron scan runs every minute, marks
+everything past its deadline as breached exactly once, and hands off to the
+escalation ladder. Rungs fire at a percentage of the SLA — 80 warns before the
+deadline, 100 fires on the breach, and above 100 is legitimate for a ticket
+somebody is clearly stuck on. Every rung a ticket has passed fires, not just the
+highest, and each fires at most once per ticket per clock; the unique constraint
+on `escalations` is what guarantees that against a scan running every minute on
+several instances at once.
+
+```bash
+# run the scan and the ladder now, instead of waiting for the cron
+curl -sX POST localhost:3000/api/v1/sla/scan -H "authorization: Bearer $TOKEN"
+
+# what has already been escalated on a ticket, and why
+curl -s localhost:3000/api/v1/tickets/$ID/escalations -H "authorization: Bearer $TOKEN"
+```
+
+`db:seed` installs a working default: Mon–Fri 08:00–17:00 Harare, the public
+holidays for this year and next, a policy for every product and priority, one
+catch-all routing rule pointing at a `Support Desk` team, and a two-rung ladder
+that warns the desk at 80% of the first-response target and raises the priority
+on any breach. All of it is ordinary data — replace it through the API.
+
+### Async jobs
+
+Jobs run on **pg-boss**, in the same process that serves HTTP, against its own
+`pgboss` schema. `/readyz` reports the queue alongside Postgres.
+
+| Job                 | Trigger            | Does                                      |
+| ------------------- | ------------------ | ----------------------------------------- |
+| `ticket.triage`     | ticket created     | matches routing rules, sets the team      |
+| `ticket.autoassign` | after triage       | picks an agent, or leaves it queued       |
+| `sla.scan`          | cron, every minute | records breaches, hands off to the ladder |
+| `sla.escalate`      | from the scan      | fires escalation rungs                    |
+
+`QUEUE_DRIVER=inline` runs a job the moment it is enqueued and **fires no
+schedule**. Tests use it, so the job path is the path under test; setting it
+anywhere real means no breach is ever detected, which is why `/readyz` reports the
+queue as `not_configured` rather than `ok` under it.
+
+SLA targets are the one exception to the queue: they are written in the same
+transaction as the ticket. A ticket whose targets went missing because a queue was
+down would look permanently on time and never escalate.
+
 ## Conventions
 
 Each entity is a folder under `src/modules/` with its own

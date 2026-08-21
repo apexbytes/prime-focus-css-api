@@ -4,6 +4,8 @@ import { isUserActor, type Actor } from '../../common/types/actor.js';
 import { sendSuccess } from '../../common/utils/response.js';
 import * as userService from './user.service.js';
 import type {
+  ChangeAvailabilityBody,
+  ChangeCapacityBody,
   ChangeRoleBody,
   ChangeStatusBody,
   ListUsersQuery,
@@ -64,4 +66,29 @@ export async function updateOwnProfile(req: Request, res: Response): Promise<voi
   if (!isUserActor(actor)) throw AppError.forbidden('This endpoint requires a signed-in user');
 
   sendSuccess(res, await userService.updateProfile(actor.id, req.body as UpdateUserBody, actor));
+}
+
+export async function changeAvailability(req: Request, res: Response): Promise<void> {
+  const { availability } = req.body as ChangeAvailabilityBody;
+  sendSuccess(
+    res,
+    await userService.setAvailability(req.params.id as string, availability, actorOf(req)),
+  );
+}
+
+/** An agent marking themselves online or away, without needing `user:manage`. */
+export async function changeOwnAvailability(req: Request, res: Response): Promise<void> {
+  const actor = actorOf(req);
+  if (!isUserActor(actor)) throw AppError.forbidden('This endpoint requires a signed-in user');
+
+  const { availability } = req.body as ChangeAvailabilityBody;
+  sendSuccess(res, await userService.setAvailability(actor.id, availability, actor));
+}
+
+export async function changeCapacity(req: Request, res: Response): Promise<void> {
+  const { maxOpenTickets } = req.body as ChangeCapacityBody;
+  sendSuccess(
+    res,
+    await userService.setCapacity(req.params.id as string, maxOpenTickets, actorOf(req)),
+  );
 }

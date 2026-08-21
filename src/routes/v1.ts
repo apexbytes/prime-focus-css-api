@@ -8,12 +8,15 @@ import { authRouter } from '../modules/auth/index.js';
 import { categoryRouter } from '../modules/category/index.js';
 import { customerRouter } from '../modules/customer/index.js';
 import { emailAdminRouter } from '../modules/email/index.js';
+import { escalationRuleRouter } from '../modules/escalation/index.js';
 import { invitationRouter } from '../modules/invitation/index.js';
 import { macroRouter } from '../modules/macro/index.js';
 import { trustedDeviceRouter } from '../modules/mfa/index.js';
 import { notificationRouter } from '../modules/notification/index.js';
 import { productRouter } from '../modules/product/index.js';
+import { routingRuleRouter } from '../modules/routing/index.js';
 import { permissionRouter, roleRouter } from '../modules/role/index.js';
+import { businessHoursRouter, slaPolicyRouter, slaRouter } from '../modules/sla/index.js';
 import { tagRouter } from '../modules/tag/index.js';
 import { teamRouter } from '../modules/team/index.js';
 import { ticketRouter } from '../modules/ticket/index.js';
@@ -36,6 +39,10 @@ const MODULES = [
   'attachments',
   'macros',
   'notifications',
+  'sla-policies',
+  'business-hours',
+  'routing-rules',
+  'escalation-rules',
 ] as const;
 
 /**
@@ -78,7 +85,12 @@ v1Router.use('/tags', tagRouter);
 v1Router.use('/tickets', ticketRouter);
 v1Router.use('/attachments', attachmentItemRouter);
 v1Router.use('/macros', macroRouter);
+
+// -- routing, service levels & escalation ------------------------------------
+v1Router.use('/sla-policies', slaPolicyRouter);
+v1Router.use('/business-hours', businessHoursRouter);
+v1Router.use('/routing-rules', routingRuleRouter);
+v1Router.use('/escalation-rules', escalationRuleRouter);
+v1Router.use('/sla', slaRouter);
 v1Router.use('/notifications', notificationRouter);
 v1Router.use('/email', emailAdminRouter);
-
-// Phase 4: sla, escalation, routing.

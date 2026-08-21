@@ -32,6 +32,11 @@ export * from '../modules/macro/macro.model.js';
 export * from '../modules/email/email.model.js';
 export * from '../modules/notification/notification.model.js';
 
+// -- phase 4: routing, service levels & escalation ---------------------------
+// sla before escalation: escalation_rules references sla_target_kind.
+export * from '../modules/sla/sla.model.js';
+export * from '../modules/routing/routing.model.js';
+export * from '../modules/escalation/escalation.model.js';
+
 // -- modules ------------------------------------------------------------------
-// Phase 4: sla, escalation, routing
 // Phase 5: knowledge-base, survey, report

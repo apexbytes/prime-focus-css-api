@@ -4,11 +4,19 @@ import { env } from './config/index.js';
 import { beginShutdown } from './common/utils/lifecycle.js';
 import { closeDatabase } from './db/client.js';
 import { createModuleLogger, logger } from './lib/logger/index.js';
+import { startQueue, stopQueue } from './lib/queue/index.js';
 
 const log = createModuleLogger('server');
 
 export function startServer(): Server {
   const app = createApp();
+
+  // After the listener, not before: a queue that cannot be reached must not stop
+  // the API from serving traffic. Jobs are recoverable — `sla.scan` re-finds
+  // whatever was missed — but a process that refuses to boot is not.
+  void startQueue().catch((error: unknown) => {
+    log.error('queue failed to start; jobs and schedules are not running', { err: error });
+  });
 
   const server = app.listen(env.PORT, () => {
     log.info('server listening', {
@@ -57,8 +65,9 @@ function registerShutdownHandlers(server: Server): void {
       });
       log.info('http server closed');
 
+      // Before the pool closes: a job still finishing needs a database.
+      await stopQueue();
       await closeDatabase();
-      // Phase 4: await stopQueue() before the pool closes.
 
       clearTimeout(forceExit);
       log.info('shutdown complete');
