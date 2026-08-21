@@ -14,7 +14,9 @@ export interface OutboundEmail extends RenderedEmail {
     | 'password_reset'
     | 'password_changed'
     | 'ticket_reply'
-    | 'ticket_acknowledgement';
+    | 'ticket_acknowledgement'
+    | 'csat_survey'
+    | 'notification_digest';
   /**
    * RFC 5322 Message-ID to send as. Set for ticket replies so the customer's
    * response carries it in `In-Reply-To`, which is how the reply threads back

@@ -14,6 +14,7 @@ export const updatePreferencesBody = z
     emailOnAssignment: z.boolean().optional(),
     emailOnCustomerReply: z.boolean().optional(),
     emailOnMention: z.boolean().optional(),
+    emailDigest: z.boolean().optional(),
   })
   .refine((value) => Object.keys(value).length > 0, 'at least one field must be provided');
 

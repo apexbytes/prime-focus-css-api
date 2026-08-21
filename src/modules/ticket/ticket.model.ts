@@ -1,3 +1,4 @@
+import { sql } from 'drizzle-orm';
 import {
   index,
   integer,
@@ -84,6 +85,15 @@ export const tickets = pgTable(
       onDelete: 'set null',
     }),
     deletedAt: instant('deleted_at'),
+    /**
+     * Set when the retention sweep has stripped this ticket's content.
+     *
+     * The marker exists because the sweep's own criterion — resolved longer ago
+     * than the retention period — stays true forever, so without it every run
+     * would re-process every old ticket and the batch limit would never make
+     * progress past the oldest few hundred.
+     */
+    anonymisedAt: instant('anonymised_at'),
     ...timestamps,
   },
   (table) => [
@@ -97,6 +107,11 @@ export const tickets = pgTable(
     index('tickets_customer_idx').on(table.customerId, table.createdAt.desc()),
     index('tickets_status_idx').on(table.status),
     index('tickets_team_idx').on(table.teamId),
+    // The retention sweep's only query: what finished long ago and still has
+    // its content. Partial, so it stays small however large the table gets.
+    index('tickets_retention_idx')
+      .on(table.resolvedAt)
+      .where(sql`anonymised_at is null and resolved_at is not null`),
   ],
 );
 

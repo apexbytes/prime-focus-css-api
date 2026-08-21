@@ -57,3 +57,21 @@ export async function recordSafely(entry: AuditEntry, actor?: Actor): Promise<vo
 export function list(filter: AuditLogFilter): Promise<AuditLogRow[]> {
   return repository.list(filter);
 }
+
+// -- retention ---------------------------------------------------------------
+
+/**
+ * Deletes audit rows past their retention period.
+ *
+ * The audit trail is the one thing the sweep genuinely destroys rather than
+ * anonymises, and it has the longest retention of anything in the system for
+ * exactly that reason — seven years under the Cyber and Data Protection Act,
+ * against five for ticket content.
+ */
+export function purgeOlderThan(before: Date, limit: number): Promise<number> {
+  return repository.deleteOlderThan(before, limit);
+}
+
+export function countOlderThan(before: Date): Promise<number> {
+  return repository.countOlderThan(before);
+}

@@ -10,13 +10,17 @@ import { customerRouter } from '../modules/customer/index.js';
 import { emailAdminRouter } from '../modules/email/index.js';
 import { escalationRuleRouter } from '../modules/escalation/index.js';
 import { invitationRouter } from '../modules/invitation/index.js';
+import { kbRouter } from '../modules/knowledge-base/index.js';
 import { macroRouter } from '../modules/macro/index.js';
 import { trustedDeviceRouter } from '../modules/mfa/index.js';
 import { notificationRouter } from '../modules/notification/index.js';
 import { productRouter } from '../modules/product/index.js';
+import { reportRouter } from '../modules/report/index.js';
+import { retentionRouter } from '../modules/retention/index.js';
 import { routingRuleRouter } from '../modules/routing/index.js';
 import { permissionRouter, roleRouter } from '../modules/role/index.js';
 import { businessHoursRouter, slaPolicyRouter, slaRouter } from '../modules/sla/index.js';
+import { csatRouter, surveyPublicRouter } from '../modules/survey/index.js';
 import { tagRouter } from '../modules/tag/index.js';
 import { teamRouter } from '../modules/team/index.js';
 import { ticketRouter } from '../modules/ticket/index.js';
@@ -43,6 +47,11 @@ const MODULES = [
   'business-hours',
   'routing-rules',
   'escalation-rules',
+  'kb',
+  'surveys',
+  'csat',
+  'reports',
+  'retention',
 ] as const;
 
 /**
@@ -94,3 +103,13 @@ v1Router.use('/escalation-rules', escalationRuleRouter);
 v1Router.use('/sla', slaRouter);
 v1Router.use('/notifications', notificationRouter);
 v1Router.use('/email', emailAdminRouter);
+
+// -- deflection & insight -----------------------------------------------------
+v1Router.use('/kb', kbRouter);
+// Unauthenticated: the token in the emailed link is the credential. Kept apart
+// from `/csat`, which is the staff read, so a token can never reach a staff
+// endpoint by taking a wrong turn in the router.
+v1Router.use('/surveys', surveyPublicRouter);
+v1Router.use('/csat', csatRouter);
+v1Router.use('/reports', reportRouter);
+v1Router.use('/retention', retentionRouter);

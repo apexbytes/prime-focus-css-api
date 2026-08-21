@@ -100,6 +100,7 @@ prime-focus-css/
 │   │   ├── email/
 │   │   ├── audit/
 │   │   ├── report/
+│   │   ├── retention/
 │   │   ├── api-key/
 │   │   ├── webhook/
 │   │   └── health/
@@ -212,8 +213,8 @@ Grouped by domain; each is a folder in `src/modules/`.
 
 ### 3.5 Self-service & feedback
 
-- **knowledge-base** — articles with draft/review/published states, product + category scoping, Postgres full-text search (`tsvector`, weighted title/body), view + helpfulness counters, "suggested articles" endpoint the ticket-creation flow calls for deflection.
-- **survey** — CSAT: token-based one-click rating emailed after resolution, score + comment, aggregation per agent/team/product.
+- **knowledge-base** — articles with draft/in_review/published/archived states, product + category scoping, Postgres full-text search (`tsvector` generated column, weighted title/keywords/body, GIN), per-edit revisions, view + helpfulness counters, and the `suggest` endpoint the ticket-creation flow calls for deflection. `visibility: internal | public` is required with no default and defaults to `internal` in the database: `internal` articles are agent runbooks, and `suggest` exists to show text to customers.
+- **survey** — CSAT: a token-based one-click rating emailed after resolution, score + comment. The token is the only bearer credential this API accepts in a URL, and the trade-off is argued in §8. Aggregation lives in `report`.
 
 ### 3.6 Platform services
 
@@ -221,8 +222,9 @@ Grouped by domain; each is a folder in `src/modules/`.
 - **notification** — in-app notification records + fan-out to email; per-user preferences; digest job.
 - **webhook** — outbound subscriptions so other Prime Focus systems can react to ticket events; HMAC-signed, retried with backoff, delivery log.
 - **audit** — append-only trail of every state change (actor, action, entity, before/after, IP, UA). Written inside the same transaction as the change. Read-only API for admins.
-- **report** — FRT, resolution time, SLA compliance, volume by product/channel/category, agent throughput, CSAT. Served from materialised views refreshed on a schedule, not from live ticket scans.
-- **health** — `/healthz` (liveness), `/readyz` (DB + queue + Resend reachability), `/metrics`.
+- **report** — FRT, resolution time, SLA compliance, volume by product/channel/category, agent throughput, CSAT, knowledge base usage. Served from six materialised views refreshed every fifteen minutes, not from live ticket scans; the one exception is the open backlog, which is a level rather than a flow and is counted live off an index. Every response carries how stale it is.
+- **retention** — the scheduled enforcement of the Cyber and Data Protection Act periods. Its own module rather than part of `audit`, because the sweep spans audit rows, message bodies, attachments and customer records: it owns none of that data and orchestrates through those modules' services. `POST /retention/sweep` dry-runs by default.
+- **health** — `/healthz` (liveness), `/readyz` (DB + queue + virus scanner + Resend reachability), `/metrics`.
 
 ---
 
@@ -268,9 +270,24 @@ window. `holidays` is calendar-scoped and keyed on a `date`, because a public
 holiday is a local calendar day and which UTC instants that covers depends on the
 calendar's zone.
 
-**Self-service**
+**Self-service & insight** — built in Phase 5
 `kb_articles`, `kb_article_revisions`, `kb_article_feedback`, `kb_views`,
-`csat_responses`.
+`csat_surveys`, `report_refreshes`, plus `anonymised_at` on `tickets` and
+`email_digest` on `notification_preferences`.
+
+`csat_surveys`, not `csat_responses`: the row is written when the survey is
+**sent**, and most rows never get a score. Response rate is itself a metric, and
+a table called `responses` full of unanswered rows would mislead everyone who
+read it later.
+
+`kb_articles.search_vector` is a **stored generated column** — Postgres maintains
+it, so no write path can update a body and forget the index. Its `english`
+configuration is baked into the DDL and cannot be a runtime setting; changing it
+means rewriting every row, which is a migration.
+
+The six `report_*` materialised views are **not** in `schema.ts`. They are
+declared `.existing()` in `report.model.ts` and their DDL is hand-written in the
+migration — see §8.
 
 **Platform**
 `notifications`, `notification_preferences`, `outbound_emails`,
@@ -287,6 +304,11 @@ calendar's zone.
   these three columns; if they drift the scan silently stops using the index
 - `kb_articles` GIN on `search_vector`
 - `audit_logs (entity_type, entity_id, created_at desc)`
+- `tickets (resolved_at) where anonymised_at is null and resolved_at is not null`
+  — the retention sweep's only query
+- a unique index over the whole grouping key of every `report_*` view, all
+  columns `not null`, because `refresh materialized view concurrently` requires
+  one
 
 **Key state machine** — enforced in `ticket.service.ts`, not the DB:
 transitions are whitelisted, each one writes an `audit_log` row and emits a
@@ -385,14 +407,25 @@ GET|PUT /users/:id/skills
 POST   /sla/scan                 (run the breach scan and the ladder now)
 POST   /escalation-rules/run     (run only the ladder now)
 
-GET    /kb/articles?product=&q=   POST /kb/articles
-GET|PATCH /kb/articles/:id        POST /kb/articles/:id/publish
-GET    /kb/search?q=&product=     POST /kb/articles/:id/feedback
-GET    /kb/suggest?subject=&body= (deflection, called before ticket create)
+GET    /kb/articles?productId=&status=&q=&cursor=   POST /kb/articles
+GET    /kb/articles/:idOrSlug     PATCH /kb/articles/:id
+POST   /kb/articles/:id/publish   (its own endpoint; PATCH cannot publish)
+GET    /kb/articles/:id/revisions GET /kb/articles/:id/feedback
+POST   /kb/articles/:idOrSlug/feedback   { helpful, comment?, ticketId? }
+GET    /kb/search?q=&productId=&includeInternal=
+GET    /kb/suggest?subject=&body= (deflection, called before ticket create —
+                                   public + published articles only, always)
 
 GET    /surveys/:token            POST /surveys/:token   (public, unauthenticated)
-GET    /reports/overview | /sla | /agents | /csat | /volume
-GET    /notifications  PATCH /notifications/:id/read  PUT /notification-preferences
+GET    /csat?productId=&ratedUserId=&answeredOnly=      (staff read)
+GET    /tickets/:id/survey        (the CSAT panel on one ticket)
+
+GET    /reports/overview | /sla | /agents | /csat | /volume   (?from=&to=&productId=)
+POST   /reports/refresh           (rebuild the views now; perm report:refresh)
+
+GET    /retention/policy          (the cutoffs and what is past them)
+POST   /retention/sweep           { dryRun }  — dryRun defaults to **true**
+POST   /attachments/:id/rescan    (requeue a scan the scanner never answered)
 
 POST   /webhooks/resend/inbound   (Svix-signed, unauthenticated, mounted ahead of
                                    the rate limiter so a spike of customer email
@@ -482,19 +515,26 @@ stable machine `code` from a single enum, never a raw driver message.
 | `sla.escalate`          | from scan                    | escalation   | Phase 4 |
 | `email.send`            | queued on notification/reply | email        | inline  |
 | `email.inbound.process` | Resend inbound webhook       | email        | inline  |
-| `survey.dispatch`       | ticket resolved + delay      | survey       | phase 5 |
-| `attachment.scan`       | upload confirmed             | attachment   | phase 5 |
-| `report.refresh`        | cron, every 15 min           | report       | phase 5 |
+| `survey.dispatch`       | ticket resolved + delay      | survey       | Phase 5 |
+| `attachment.scan`       | upload confirmed             | attachment   | Phase 5 |
+| `report.refresh`        | cron, every 15 min           | report       | Phase 5 |
+| `notification.digest`   | cron, daily 07:00 CAT        | notification | Phase 5 |
+| `retention.sweep`       | cron, weekly                 | retention    | Phase 5 |
 | `webhook.deliver`       | domain event                 | webhook      | phase 6 |
-| `notification.digest`   | cron, daily 07:00 CAT        | notification | phase 5 |
-| `retention.sweep`       | cron, weekly                 | audit        | phase 5 |
 
 `email.send` and `email.inbound.process` are marked _inline_: they exist and work,
 but they still run in the request that causes them rather than as queued jobs.
 Phase 4 deliberately did not move them — the Phase 3 email path is verified
 behaviour and rewriting it buys retry-across-restart at the cost of re-proving
-threading and acknowledgement. Moving them is a contained change now that
-`lib/queue` exists.
+threading and acknowledgement. Phase 5 did not move them either; it added the
+`notification.digest`, which is where most of the value of an email queue was,
+without touching the threading path. Moving them stays a contained change.
+
+`retention.sweep`'s owner is a **`retention` module**, not `audit` as originally
+planned. The sweep spans four modules' data — audit rows, message bodies,
+attachments, customer records — so it owns none of them; it orchestrates through
+their services. Putting it inside `audit` would have made that module the writer
+of three other modules' tables.
 
 Handlers are registered by `src/workers/index.ts`, which `createApp()` calls.
 Registration is pure bookkeeping — a name-to-handler map — so it is safe during
@@ -669,8 +709,123 @@ Decisions worth knowing:
   not silently run out), a policy per product and priority, a `Support Desk` team,
   a catch-all routing rule, and a two-rung ladder.
 
-**Phase 5 — deflection & insight**
-knowledge-base + search, survey/CSAT, report views.
+**Phase 5 — deflection & insight** — _complete_
+knowledge-base, survey, report and retention, plus `lib/antivirus` and the four
+retrofit jobs. 7 more tables, 6 materialised views, 2 columns, 26 more endpoints.
+
+Verified end to end: an article is written, reviewed and published; a customer's
+half-typed query pulls it back out of a weighted full-text index while an agent's
+runbook on the same subject stays invisible; a resolved ticket asks the customer
+how it went and the answer lands in a dashboard alongside SLA compliance and
+agent throughput; an uploaded document is scanned before anyone can open it; and
+a ticket six years past its retention period has its content stripped while its
+row — and its numbers — survive.
+
+Decisions worth knowing:
+
+- **`visibility` is the highest-stakes flag in the knowledge base**, for the
+  same reason message `visibility` is in ticketing. `internal` articles are
+  escalation contacts and fraud procedure; `GET /kb/suggest` exists to put text
+  in front of customers. The column **defaults to `internal`** so any future
+  write path that forgets the field fails closed, the API requires it
+  explicitly, and `suggest` filters to `public` **in SQL, unconditionally** —
+  not "unless the caller holds a permission". An API key never counts as staff
+  however it was scoped: a product system is a customer-facing surface.
+- **Search and suggest have opposite semantics, and that is the whole of
+  `knowledge-base.search.ts`.** `websearch_to_tsquery` ANDs its terms, which is
+  right for a search box and useless for a ticket body — a customer's paragraph
+  ANDed together matches no article ever written. So a search query is passed
+  through, and a suggestion query is reduced to its distinctive words and joined
+  with `or`, with ranking rather than matching deciding what comes back. "hello
+  please help" yields nothing, deliberately: an arbitrary article is worse than
+  none.
+- **`search_vector` is a stored generated column**, weighted A/B/C over
+  title / keywords+summary / body. Postgres maintains it, so no write path can
+  change a body and forget the index. Two consequences: the `english`
+  configuration is baked in and changing it is a migration, and
+  `array_to_string` — which Postgres marks STABLE — had to be wrapped in an
+  IMMUTABLE `kb_keywords_text(text[])`. Narrowing that signature to `text[]` is
+  what makes the declaration sound rather than a lie; an `anyarray` version
+  would not be.
+- **CSAT is delayed and re-checked, not fired on resolve.** The delay is
+  precisely the window in which a customer replies "that did not work" and
+  reopens the ticket, so `survey.dispatch` re-reads the ticket's state when it
+  runs. Every reason not to send is a `skipped`, not a failure: never replied to,
+  already surveyed, customer surveyed this week. A customer who raised five
+  tickets is asked once, because survey fatigue is how a response rate reaches
+  zero.
+- **The survey token is the one bearer credential in a URL.** The rest of the
+  API takes invitation and reset tokens in a body only. A one-click rating link
+  cannot POST, and this token grants exactly one thing: a score on one
+  already-resolved ticket. It carries no session, the prompt returns only the
+  reference the customer already has in their inbox, it expires, it answers once,
+  and it is stored as an HMAC digest like everything else. An invitation token,
+  which sets a password, gets no such exception. The email links to the console,
+  which POSTs — a GET that recorded a rating would be cast by the first mail
+  scanner to follow it.
+- **Reports are six materialised views with hand-written DDL**, declared
+  `.existing()` so `drizzle-kit` leaves them alone. Each is an aggregate with
+  `filter` clauses and — for the agent view — a full outer join across three
+  grains, none of which the query builder expresses; a reviewer should read the
+  SQL that runs. Two invariants: every view buckets by **local** calendar day
+  with the zone baked in (bucketing by UTC would file every evening after 22:00
+  under the previous day), and every grouping key is `not null` and uniquely
+  indexed, because `refresh concurrently` needs that. Per-category and per-agent
+  figures are separate views rather than nullable dimensions for exactly that
+  reason.
+- **Durations in the views are wall clock; compliance is not.** A materialised
+  view cannot call the SLA clock, so anything answering to a service level comes
+  from `report_sla_daily`, which reads the targets the clock itself wrote.
+  Compliance is `met ÷ (met + breached)` with running targets excluded — count
+  them either way and this morning's figure becomes a function of the time of
+  day.
+- **Every report says how stale it is**, and reports the _oldest_ refresh across
+  the views it reads. Taking the newest would hide a view that has been failing
+  for a week behind one that succeeded a minute ago. The backlog is the one
+  figure read live: it is a level, not a flow, and yesterday's snapshot is not
+  today's queue.
+- **Reports are product-scoped.** `report:view` is held by tier-2 specialists,
+  who are product-scoped, so every read goes through one `scopedRange` — an
+  unscoped report would be a cross-product leak dressed up as a dashboard.
+- **The unused `uploaded` attachment status became the scan lifecycle.** Bytes
+  land as `uploaded`, and `attachment.scan` settles it to `clean`, `infected` or
+  `skipped`. A download is **refused** while it is still `uploaded`: an agent
+  who cannot open a statement for a minute is an inconvenience, an agent who
+  opens malware is an incident, and `POST /attachments/:id/rescan` is the way
+  out when a scanner outage leaves one stuck. A scanner failure **throws** so
+  pg-boss retries it — writing `skipped` on a connection error would record "we
+  chose not to scan this".
+- **`lib/antivirus` follows the `EMAIL_TRANSPORT=log` pattern**: clamd over TCP,
+  or a `none` driver that records `skipped` and reports `not_configured` rather
+  than `ok`. Production refuses to boot without either a scanner or an explicit
+  opt-out. The `.exe` denylist stays — a scanner asks "is this known malware",
+  the denylist asks "is there any reason a customer would send this to a support
+  desk", and novel malware passes the first.
+- **The digest is one email a morning, not an email per notification.** That was
+  the cheaper half of the email fan-out and most of its value: an agent who lives
+  in the console does not want six emails a day, and one who never opens it needs
+  one. Agents with nothing waiting are not emailed at all — a daily "you have
+  nothing" is how a digest gets filtered away, taking the useful ones with it.
+- **`retention.sweep` got its own module.** It spans audit rows, message bodies,
+  attachments and customer records, so it owns none of them and orchestrates
+  through their services. `POST /retention/sweep` **dry-runs by default** —
+  an operator POSTing an empty body to find out what an endpoint does should get
+  a report, not a deletion — and `retention:run` is held by no seeded role except
+  `super_admin` through the wildcard. The cron runs for real, because a schedule
+  that only ever reported would satisfy nothing.
+- **`anonymised_at` on `tickets` is what makes the sweep terminate.** The age
+  criterion stays true forever, so without a marker each run would reprocess the
+  same oldest rows and never reach the rest. Content is anonymised in place and
+  attachments are deleted outright: a stored document _is_ the personal data, so
+  there is nothing left to anonymise once the file is gone.
+- **A policy where the audit trail dies before the content it describes is
+  refused, not clamped.** `RETENTION_AUDIT_LOG_YEARS` below
+  `RETENTION_TICKET_YEARS` would delete the record of an anonymisation before
+  performing it — which is exactly what an auditor asks to see.
+- **No knowledge base is seeded.** Unlike the Phase 4 defaults, which make a
+  fresh deployment escalate rather than sit inert, seeded help articles would be
+  fabricated advice about a financial product that `suggest` then shows to real
+  customers. An empty knowledge base is a valid state; invented content is not.
 
 **Phase 6 — realtime & scale**
 socket.io (locks, typing, live counts), Redis cache + rate limits, outbound
@@ -696,10 +851,26 @@ STORAGE_ENDPOINT, STORAGE_BUCKET, STORAGE_KEY, STORAGE_SECRET
 QUEUE_DRIVER, QUEUE_SCHEMA, QUEUE_CONCURRENCY, QUEUE_JOB_EXPIRY_SECONDS, QUEUE_RETRY_LIMIT
 SLA_SCAN_CRON, SLA_SCAN_BATCH_SIZE
 AUTO_ASSIGN_ENABLED, ROUTING_ASSIGN_TO_AWAY_AGENTS, DEFAULT_AGENT_MAX_OPEN_TICKETS
+KB_SUGGEST_LIMIT
+CSAT_ENABLED, CSAT_DELAY_MINUTES, CSAT_TOKEN_TTL_DAYS, CSAT_CUSTOMER_COOLDOWN_DAYS
+REPORT_REFRESH_CRON
+ANTIVIRUS_DRIVER, ANTIVIRUS_HOST, ANTIVIRUS_PORT, ANTIVIRUS_TIMEOUT_MS, ANTIVIRUS_MAX_BYTES
+NOTIFICATION_DIGEST_CRON, NOTIFICATION_DIGEST_ENABLED
+RETENTION_SWEEP_CRON, RETENTION_SWEEP_ENABLED, RETENTION_AUDIT_LOG_YEARS,
+RETENTION_TICKET_YEARS, RETENTION_SWEEP_BATCH_SIZE
 REDIS_URL                      # phase 6
 RATE_LIMIT_WINDOW, RATE_LIMIT_MAX
 DEFAULT_TIMEZONE=Africa/Harare
 ```
+
+Three settings are **not** runtime settings despite looking like they could be,
+because each is baked into stored SQL and changing it means a migration:
+
+- the knowledge base's `english` text-search configuration, in
+  `kb_articles.search_vector`
+- the `Africa/Harare` day boundary in all six `report_*` views
+- `DEFAULT_TIMEZONE` therefore has to agree with that boundary; they are
+  independent values today and a mismatch would silently shift every report
 
 `config/env.ts` parses these with Zod and throws at boot on anything missing
 or malformed — never `process.env.X` anywhere else in the codebase.
@@ -742,11 +913,28 @@ Called out so the trade-offs are explicit, not silently dropped:
    from day one; only email, web form, and product-system API are implemented.
    Adding WhatsApp is a new adapter, not a schema change.
 4. **Data lake → materialised views.** Real-time dashboards come from Postgres
-   materialised views refreshed on a schedule. A warehouse export is a Phase 6+
-   concern once reporting queries actually contend with transactional load.
-5. **SSO moved last.** Local auth + mandatory TOTP secures staff now; SSO is
-   an added strategy in Phase 7, not a prerequisite.
-6. **Full microservices → modular monolith.** Every module already owns its
+   materialised views refreshed on a schedule, as built in Phase 5: six views,
+   rebuilt every fifteen minutes, with every response stamped with how stale it
+   is. A warehouse export is a Phase 6+ concern once reporting queries actually
+   contend with transactional load.
+
+   Two things this costs, stated rather than hidden: durations in the views are
+   wall clock rather than working time, because a view cannot call the SLA clock —
+   so anything answering to a service level reads the targets instead. And
+   deflection is measured as suggestions-per-ticket-raised, a proxy. Saying a
+   suggestion _prevented_ a ticket needs session tracking that does not exist,
+   and the field is named for what it counts.
+
+5. **AI chatbot deflection → full-text search.** The draft's deflection layer was
+   an AI chatbot doing semantic search. What Phase 5 built is a weighted
+   `tsvector` index and a query builder that turns a half-typed ticket into an
+   OR-of-distinctive-terms. The seam is the same one an embedding model would
+   plug into — `GET /kb/suggest` returns a ranked list and the caller does not
+   care how it was ranked — but the ranking is lexical, so a customer describing
+   a failed transfer in words no article uses gets nothing back.
+6. **SSO moved last.** Local auth plus the emailed second factor secures staff
+   now; SSO is an added strategy in Phase 7, not a prerequisite.
+7. **Full microservices → modular monolith.** Every module already owns its
    routes/service/repository/schema with enforced boundaries, so any of them
    can be extracted later. Starting distributed would buy distributed-tracing
    pain before there is load to justify it.

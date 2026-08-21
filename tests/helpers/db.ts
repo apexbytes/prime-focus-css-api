@@ -13,6 +13,12 @@ import { invalidateCalendarCache } from '../../src/modules/sla/sla.service.js';
  */
 const TABLES = [
   'audit_logs',
+  'report_refreshes',
+  'csat_surveys',
+  'kb_views',
+  'kb_article_feedback',
+  'kb_article_revisions',
+  'kb_articles',
   'escalations',
   'escalation_rules',
   'routing_rules',
@@ -56,7 +62,14 @@ const TABLES = [
   'idempotency_keys',
 ];
 
-/** Truncates everything and restores the permission/role baseline. */
+/**
+ * Truncates everything and restores the permission/role baseline.
+ *
+ * The reporting materialised views are deliberately **not** refreshed here. They
+ * are derived, refreshing six of them between every case would dominate the
+ * suite's runtime, and a spec that asserts on a report has to refresh anyway to
+ * be asserting on its own data rather than on whatever the last refresh caught.
+ */
 export async function resetDatabase(): Promise<void> {
   await db.execute(sql.raw(`truncate table ${TABLES.join(', ')} restart identity cascade`));
   await seedPermissions();

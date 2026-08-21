@@ -90,6 +90,18 @@ export const PERMISSION_CATALOGUE = [
   },
   // reporting (Phase 5)
   { code: 'report:view', description: 'View dashboards and reports', category: 'reporting' },
+  {
+    code: 'report:refresh',
+    description: 'Rebuild the reporting views by hand instead of waiting for the schedule',
+    category: 'reporting',
+  },
+  // retention (Phase 5)
+  {
+    code: 'retention:run',
+    description:
+      'Run the data-retention sweep by hand, deleting and anonymising data past its retention period',
+    category: 'retention',
+  },
 ] as const;
 
 export type PermissionCode = (typeof PERMISSION_CATALOGUE)[number]['code'];
@@ -148,6 +160,7 @@ export const SYSTEM_ROLES: readonly SystemRoleDefinition[] = [
       'kb:manage',
       'sla:manage',
       'report:view',
+      'report:refresh',
     ],
   },
   {

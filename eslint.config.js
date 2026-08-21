@@ -125,8 +125,10 @@ export default tseslint.config(
         {
           type: 'module-shared',
           // Pure, dependency-light logic a module wants to unit test on its own:
-          // the ticket state machine, the SLA clock, the routing scorer.
-          pattern: 'src/modules/*/*.{schema,types,events,policy,mapper,status,clock,scoring}.ts',
+          // the ticket state machine, the SLA clock, the routing scorer, the
+          // knowledge base's query builder, the retention cutoffs.
+          pattern:
+            'src/modules/*/*.{schema,types,events,policy,mapper,status,clock,scoring,search,range,retention}.ts',
           mode: 'file',
           capture: ['module'],
         },

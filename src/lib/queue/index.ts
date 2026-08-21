@@ -13,6 +13,11 @@ export const JOB = {
   ticketAutoassign: 'ticket.autoassign',
   slaScan: 'sla.scan',
   slaEscalate: 'sla.escalate',
+  surveyDispatch: 'survey.dispatch',
+  attachmentScan: 'attachment.scan',
+  reportRefresh: 'report.refresh',
+  notificationDigest: 'notification.digest',
+  retentionSweep: 'retention.sweep',
 } as const;
 
 export type JobName = (typeof JOB)[keyof typeof JOB];

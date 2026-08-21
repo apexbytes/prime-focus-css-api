@@ -38,5 +38,10 @@ export * from '../modules/sla/sla.model.js';
 export * from '../modules/routing/routing.model.js';
 export * from '../modules/escalation/escalation.model.js';
 
-// -- modules ------------------------------------------------------------------
-// Phase 5: knowledge-base, survey, report
+// -- phase 5: deflection & insight -------------------------------------------
+// knowledge-base before report: the reporting views reference kb_view_source.
+export * from '../modules/knowledge-base/knowledge-base.model.js';
+export * from '../modules/survey/survey.model.js';
+// The materialised views themselves are declared `.existing()` and their DDL
+// lives in the migration by hand; only `report_refreshes` is a real table here.
+export * from '../modules/report/report.model.js';

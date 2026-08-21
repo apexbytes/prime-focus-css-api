@@ -6,6 +6,7 @@ export {
   emailTransport,
   queueDriver,
   storageBackend,
+  antivirusDriver,
   isDevelopment,
   isProduction,
   isTest,

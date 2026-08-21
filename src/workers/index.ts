@@ -1,7 +1,12 @@
 import { createModuleLogger } from '../lib/logger/index.js';
+import { registerAttachmentJobs } from '../modules/attachment/index.js';
 import { registerEscalationJobs } from '../modules/escalation/index.js';
+import { registerNotificationJobs } from '../modules/notification/index.js';
+import { registerReportJobs } from '../modules/report/index.js';
+import { registerRetentionJobs } from '../modules/retention/index.js';
 import { registerRoutingJobs } from '../modules/routing/index.js';
 import { registerSlaJobs } from '../modules/sla/index.js';
+import { registerSurveyJobs } from '../modules/survey/index.js';
 
 const log = createModuleLogger('workers');
 
@@ -31,6 +36,11 @@ export function registerJobHandlers(): void {
   registerRoutingJobs();
   registerSlaJobs();
   registerEscalationJobs();
+  registerSurveyJobs();
+  registerAttachmentJobs();
+  registerReportJobs();
+  registerNotificationJobs();
+  registerRetentionJobs();
 
   log.debug('job handlers registered');
 }

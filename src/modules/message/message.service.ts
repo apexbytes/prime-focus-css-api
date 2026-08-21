@@ -269,3 +269,13 @@ export function existsWithExternalMessageId(
 ): Promise<boolean> {
   return repository.existsWithExternalMessageId(externalMessageId, exec);
 }
+
+// -- retention ---------------------------------------------------------------
+
+/**
+ * Strips the words out of every message on these tickets, keeping the thread's
+ * shape. Called by the retention sweep; there is no request path to it.
+ */
+export function anonymiseForTickets(ticketIds: readonly string[]): Promise<number> {
+  return repository.anonymiseForTickets(ticketIds);
+}

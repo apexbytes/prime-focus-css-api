@@ -7,9 +7,9 @@ export interface RenderedEmail {
 }
 
 /**
- * Plain template literals rather than a templating engine: there are four
- * transactional emails, all of them short, and every value below is
- * HTML-escaped at the point of interpolation.
+ * Plain template literals rather than a templating engine: the transactional
+ * emails are all short, and every value below is HTML-escaped at the point of
+ * interpolation.
  */
 function escapeHtml(value: string): string {
   return value
@@ -216,6 +216,128 @@ export function passwordChangedEmail(input: { fullName: string; at: Date }): Ren
       `Your password was changed at ${when}. All other sessions and trusted devices were signed out.`,
       '',
       'If this was not you, contact your administrator immediately.',
+    ].join('\n'),
+  };
+}
+
+/**
+ * Asks a customer how the query went.
+ *
+ * Five links rather than a form, because a survey that takes one click gets
+ * answered and one that takes a page load does not. Each link lands on the
+ * console's rating page with the score preselected — the actual write is a POST
+ * from there, so the rating is never cast by a mail client prefetching a link
+ * or a scanner following it.
+ */
+export function csatSurveyEmail(input: {
+  fullName: string;
+  reference: string;
+  subject: string;
+  productName: string;
+  agentName: string | null;
+  surveyUrl: (score: number) => string;
+}): RenderedEmail {
+  const heading = 'How did we do?';
+
+  const scale = [1, 2, 3, 4, 5]
+    .map(
+      (score) =>
+        `<a href="${escapeHtml(input.surveyUrl(score))}" style="display:inline-block;min-width:44px;margin:0 4px 8px 0;padding:12px 0;text-align:center;background:#f5f6f8;border:1px solid #e4e7ec;border-radius:6px;color:#1f2430;text-decoration:none;font-weight:600;font-size:18px;">${score}</a>`,
+    )
+    .join('');
+
+  const handled = input.agentName
+    ? `<p style="margin:0 0 12px;">${escapeHtml(input.agentName)} handled it.</p>`
+    : '';
+
+  const html = layout(
+    heading,
+    `<p style="margin:0 0 12px;">Hello ${escapeHtml(input.fullName)},</p>
+     <p style="margin:0 0 12px;">Your ${escapeHtml(input.productName)} query
+       <strong>${escapeHtml(input.reference)}</strong> — ${escapeHtml(input.subject)} — is marked resolved.</p>
+     ${handled}
+     <p style="margin:0 0 8px;">How satisfied are you with how it was handled? 1 is very poor, 5 is very good.</p>
+     <p style="margin:0 0 16px;">${scale}</p>
+     <p style="margin:0;font-size:13px;color:#6b7280;">One question, one click. If the query is not actually
+       resolved, reply to the original email instead and it will be reopened.</p>`,
+  );
+
+  return {
+    subject: `[${input.reference}] How did we do?`,
+    html,
+    text: [
+      `Hello ${input.fullName},`,
+      '',
+      `Your ${input.productName} query ${input.reference} — ${input.subject} — is marked resolved.`,
+      input.agentName ? `${input.agentName} handled it.` : '',
+      '',
+      'How satisfied are you with how it was handled? 1 is very poor, 5 is very good.',
+      '',
+      ...[1, 2, 3, 4, 5].map((score) => `${score}: ${input.surveyUrl(score)}`),
+      '',
+      'If the query is not actually resolved, reply to the original email instead and it',
+      'will be reopened.',
+    ]
+      .filter(Boolean)
+      .join('\n'),
+  };
+}
+
+/**
+ * The morning digest: what is waiting for one agent.
+ *
+ * Counts and references only. A digest that quoted ticket bodies would put
+ * customer detail into an inbox outside the system, which the logging and
+ * retention rules both exist to prevent.
+ */
+export function notificationDigestEmail(input: {
+  fullName: string;
+  unreadNotifications: number;
+  assignedOpen: number;
+  breaching: { reference: string; subject: string }[];
+  consoleUrl: string;
+}): RenderedEmail {
+  const heading = 'Your support desk this morning';
+
+  const breachList =
+    input.breaching.length > 0
+      ? `<p style="margin:16px 0 6px;font-size:13px;color:#6b7280;">Past or near their deadline:</p>
+         <ul style="margin:0;padding-left:18px;">${input.breaching
+           .map(
+             (ticket) =>
+               `<li style="margin:0 0 4px;"><strong style="font-family:ui-monospace,SFMono-Regular,Menlo,monospace;">${escapeHtml(ticket.reference)}</strong> — ${escapeHtml(ticket.subject)}</li>`,
+           )
+           .join('')}</ul>`
+      : '<p style="margin:16px 0 0;">Nothing is past its deadline.</p>';
+
+  const html = layout(
+    heading,
+    `<p style="margin:0 0 12px;">Hello ${escapeHtml(input.fullName)},</p>
+     <p style="margin:0;">You have <strong>${input.assignedOpen}</strong> open
+       ${input.assignedOpen === 1 ? 'ticket' : 'tickets'} assigned to you and
+       <strong>${input.unreadNotifications}</strong> unread
+       ${input.unreadNotifications === 1 ? 'notification' : 'notifications'}.</p>
+     ${breachList}
+     ${button(input.consoleUrl, 'Open the console')}`,
+  );
+
+  return {
+    subject: heading,
+    html,
+    text: [
+      `Hello ${input.fullName},`,
+      '',
+      `Open tickets assigned to you: ${input.assignedOpen}`,
+      `Unread notifications: ${input.unreadNotifications}`,
+      '',
+      input.breaching.length > 0
+        ? [
+            'Past or near their deadline:',
+            ...input.breaching.map((t) => `  ${t.reference} — ${t.subject}`),
+          ].join('\n')
+        : 'Nothing is past its deadline.',
+      '',
+      input.consoleUrl,
     ].join('\n'),
   };
 }
