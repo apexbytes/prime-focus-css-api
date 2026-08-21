@@ -70,3 +70,15 @@ export async function deleteAttachment(req: Request, res: Response): Promise<voi
   await attachmentService.remove(req.params.id as string, actorOf(req));
   sendNoContent(res);
 }
+
+/**
+ * Queues another scan.
+ *
+ * 202: the scan happens on the queue, so the status in the response is
+ * `uploaded` — what the caller has done is ask, not get an answer.
+ */
+export async function rescanAttachment(req: Request, res: Response): Promise<void> {
+  sendSuccess(res, await attachmentService.requeueScan(req.params.id as string, actorOf(req)), {
+    status: 202,
+  });
+}

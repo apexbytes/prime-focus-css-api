@@ -61,6 +61,18 @@ describe('system roles', () => {
     expect(granted.has('ticket:reply')).toBe(true);
   });
 
+  it('keeps the data-destroying permission out of every seeded role but one', () => {
+    // `retention:run` permanently deletes audit rows and anonymises customer
+    // records. Running the support operation does not include doing that by
+    // hand, so only super_admin holds it — through the wildcard.
+    for (const role of SYSTEM_ROLES) {
+      const granted = new Set(resolveRolePermissions(role));
+      expect(granted.has('retention:run'), `${role.code} should not hold retention:run`).toBe(
+        role.code === SUPER_ADMIN_ROLE_CODE,
+      );
+    }
+  });
+
   it('does not let an administrator manage roles', () => {
     // Only super_admin edits the permission model, so an admin cannot grant
     // themselves more than they were given.

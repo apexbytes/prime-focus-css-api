@@ -308,7 +308,7 @@ export async function updateFields(
     assertTransition(before.status, patch.status);
   }
 
-  await withTransaction(async ({ tx }) => {
+  await withTransaction(async ({ tx, afterCommit }) => {
     const row = await repository.update(
       id,
       {
@@ -357,9 +357,38 @@ export async function updateFields(
       actor,
       tx,
     );
+
+    // Resolution is what earns the right to ask the customer how it went.
+    // Delayed, and re-checked when the job runs: the delay is exactly the
+    // window in which a customer replies "that did not work" and reopens it.
+    if (becameResolved(before.status, row.status)) {
+      afterCommit(async () => {
+        await enqueue(
+          JOB.surveyDispatch,
+          { ticketId: id },
+          {
+            startAfterSeconds: env.CSAT_DELAY_MINUTES * 60,
+            // One pending survey per ticket, however many times an agent
+            // toggles resolved and back.
+            singletonKey: `${JOB.surveyDispatch}:${id}`,
+          },
+        );
+      });
+    }
   });
 
   return get(id, actor);
+}
+
+/**
+ * Whether this status change is the one that finished the ticket.
+ *
+ * `resolved → closed` is not: the survey is already on its way, and asking twice
+ * about one query is how a response rate reaches zero.
+ */
+function becameResolved(from: TicketStatus, to: TicketStatus): boolean {
+  const finished = (status: TicketStatus): boolean => status === 'resolved' || status === 'closed';
+  return finished(to) && !finished(from);
 }
 
 /**
@@ -620,4 +649,22 @@ export function findByReference(
 
 export function findRawById(id: string, exec?: Executor): Promise<TicketRow | undefined> {
   return repository.findRawById(id, exec);
+}
+
+// -- retention ---------------------------------------------------------------
+
+/**
+ * Tickets whose content is past its retention period.
+ *
+ * Exposed for the retention sweep rather than for any request path, which is why
+ * it takes no actor: it runs as a scheduled system job over every product at
+ * once, and scoping it to a caller would make compliance a function of who
+ * happened to trigger it.
+ */
+export function listPastRetention(before: Date, limit: number) {
+  return repository.listPastRetention(before, limit);
+}
+
+export function markAnonymised(ids: readonly string[], at: Date): Promise<number> {
+  return repository.markAnonymised(ids, at);
 }

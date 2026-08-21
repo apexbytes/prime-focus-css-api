@@ -1,4 +1,4 @@
-import { and, asc, eq, gt } from 'drizzle-orm';
+import { and, asc, eq, gt, inArray } from 'drizzle-orm';
 import { db } from '../../db/client.js';
 import type { Executor } from '../../db/transaction.js';
 import { customers } from '../customer/customer.model.js';
@@ -99,4 +99,32 @@ export async function existsWithExternalMessageId(
 
 export async function markFirstResponse(id: string, exec: Executor = db): Promise<void> {
   await exec.update(ticketMessages).set({ isFirstResponse: true }).where(eq(ticketMessages.id, id));
+}
+
+// -- retention ---------------------------------------------------------------
+
+/** What a message body says once its retention period has passed. */
+export const RETENTION_BODY = '[content removed under the data retention policy]';
+
+/**
+ * Replaces the content of every message on these tickets.
+ *
+ * Update rather than delete: the thread's shape — who said something and when —
+ * is what the audit trail and the reporting views are built on, and deleting the
+ * rows would change five-year-old volume figures retroactively. Only the words
+ * go.
+ */
+export async function anonymiseForTickets(
+  ticketIds: readonly string[],
+  exec: Executor = db,
+): Promise<number> {
+  if (ticketIds.length === 0) return 0;
+
+  const updated = await exec
+    .update(ticketMessages)
+    .set({ body: RETENTION_BODY, bodyHtml: null })
+    .where(inArray(ticketMessages.ticketId, [...ticketIds]))
+    .returning({ id: ticketMessages.id });
+
+  return updated.length;
 }

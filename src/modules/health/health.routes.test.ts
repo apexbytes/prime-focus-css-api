@@ -82,8 +82,15 @@ describe('GET /readyz', () => {
     const response = await request(createApp()).get('/readyz');
     const names = response.body.data.dependencies.map((d: { name: string }) => d.name);
 
-    expect(names).toEqual(expect.arrayContaining(['queue', 'resend']));
+    expect(names).toEqual(expect.arrayContaining(['queue', 'resend', 'antivirus']));
     expect(response.body.data.status).toBe('ok');
+
+    // With no scanner configured the probe stays green but says so, rather than
+    // reporting `ok` and implying uploads are being looked at.
+    const scanner = response.body.data.dependencies.find(
+      (d: { name: string }) => d.name === 'antivirus',
+    );
+    expect(scanner.state).toBe('not_configured');
   });
 });
 

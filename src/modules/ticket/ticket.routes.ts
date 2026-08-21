@@ -6,6 +6,7 @@ import { ticketEscalationRouter } from '../escalation/escalation.routes.js';
 import { messageRouter } from '../message/message.routes.js';
 import { ticketRoutingRouter } from '../routing/routing.routes.js';
 import { ticketSlaRouter } from '../sla/sla.routes.js';
+import { ticketSurveyRouter } from '../survey/survey.routes.js';
 import {
   addTicketTag,
   assignTicket,
@@ -121,3 +122,4 @@ ticketRouter.use('/:ticketId/attachments', attachmentRouter);
 ticketRouter.use('/:ticketId/sla', ticketSlaRouter);
 ticketRouter.use('/:ticketId/escalations', ticketEscalationRouter);
 ticketRouter.use('/:ticketId/routing', ticketRoutingRouter);
+ticketRouter.use('/:ticketId/survey', ticketSurveyRouter);

@@ -196,3 +196,54 @@ export async function watcherIds(ticketId: string, exec: Executor = db): Promise
 
   return rows.map((row) => row.userId);
 }
+
+// -- retention ---------------------------------------------------------------
+
+/**
+ * Tickets finished longer ago than the retention period, whose content is still
+ * on file.
+ *
+ * `anonymised_at is null` is what makes the batch make progress: the age
+ * criterion stays true forever, so without the marker each run would return the
+ * same oldest rows and the sweep would never reach the rest.
+ */
+export function listPastRetention(
+  before: Date,
+  limit: number,
+  exec: Executor = db,
+): Promise<{ id: string; reference: string; customerId: string }[]> {
+  return exec
+    .select({ id: tickets.id, reference: tickets.reference, customerId: tickets.customerId })
+    .from(tickets)
+    .where(
+      and(
+        isNull(tickets.anonymisedAt),
+        sql`${tickets.resolvedAt} is not null and ${tickets.resolvedAt} < ${before}`,
+      ),
+    )
+    .orderBy(tickets.resolvedAt)
+    .limit(limit);
+}
+
+export async function markAnonymised(
+  ids: readonly string[],
+  at: Date,
+  exec: Executor = db,
+): Promise<number> {
+  if (ids.length === 0) return 0;
+
+  const updated = await exec
+    .update(tickets)
+    .set({ anonymisedAt: at, subject: RETENTION_SUBJECT })
+    .where(inArray(tickets.id, [...ids]))
+    .returning({ id: tickets.id });
+
+  return updated.length;
+}
+
+/**
+ * The subject is replaced along with the bodies: customers write account
+ * numbers and names into subject lines, and a report grouped by subject is not
+ * a thing anybody builds.
+ */
+export const RETENTION_SUBJECT = '[content removed under the data retention policy]';

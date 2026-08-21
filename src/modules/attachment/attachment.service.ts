@@ -1,8 +1,10 @@
-import { API_PREFIX, env } from '../../config/index.js';
+import { antivirusDriver, API_PREFIX, env } from '../../config/index.js';
 import { AppError } from '../../common/errors/index.js';
 import { isUserActor, type Actor } from '../../common/types/actor.js';
 import { withTransaction } from '../../db/transaction.js';
+import { scanBuffer } from '../../lib/antivirus/index.js';
 import { createModuleLogger } from '../../lib/logger/index.js';
+import { enqueue, JOB } from '../../lib/queue/index.js';
 import {
   buildStorageKey,
   deleteObject,
@@ -14,6 +16,7 @@ import {
   supportsPresigning,
 } from '../../lib/storage/index.js';
 import * as auditService from '../audit/audit.service.js';
+import * as notificationService from '../notification/notification.service.js';
 import * as ticketService from '../ticket/ticket.service.js';
 import type { AttachmentRow } from './attachment.model.js';
 import * as repository from './attachment.repository.js';
@@ -21,9 +24,12 @@ import * as repository from './attachment.repository.js';
 const log = createModuleLogger('attachment');
 
 /**
- * Executables and scripts are refused outright. Phase 4 adds real scanning; until
- * then the denylist is the only thing standing between a support inbox and an
- * agent double-clicking a `.exe` a "customer" sent.
+ * Executables and scripts are refused outright, whatever the scanner says.
+ *
+ * Kept now that scanning exists, because the two answer different questions: a
+ * scanner asks "is this known malware", the denylist asks "is there any reason a
+ * customer would send this to a support desk". A novel `.exe` passes the first
+ * and fails the second.
  */
 const BLOCKED_EXTENSIONS = new Set([
   'exe',
@@ -154,7 +160,9 @@ export async function storeContent(id: string, body: Buffer, actor: Actor): Prom
 
   const checksum = await putObject(row.storageKey, body, row.contentType);
   const updated = await repository.update(id, {
-    status: 'skipped',
+    // `uploaded` means the bytes are here and nothing has looked at them yet.
+    // The scan job is what moves it to `clean`, `infected` or `skipped`.
+    status: 'uploaded',
     sizeBytes: body.byteLength,
     checksum,
     uploadedAt: new Date(),
@@ -162,7 +170,11 @@ export async function storeContent(id: string, body: Buffer, actor: Actor): Prom
 
   log.info('attachment stored', { attachmentId: id, sizeBytes: body.byteLength });
   if (!updated) throw AppError.notFound('Attachment not found');
-  return updated;
+
+  await enqueue(JOB.attachmentScan, { attachmentId: id });
+  // Re-read: under the inline driver the scan has already run and settled the
+  // status, and answering `uploaded` would describe a row that no longer exists.
+  return (await repository.findById(id)) ?? updated;
 }
 
 /**
@@ -187,16 +199,19 @@ export async function confirmUpload(
   }
 
   const updated = await repository.update(id, {
-    // `skipped` rather than `clean`: nothing has scanned it yet, and saying
-    // otherwise would be a lie the console would display.
-    status: 'skipped',
+    // `uploaded`, not `clean`: nothing has scanned it yet, and saying otherwise
+    // would be a lie the console would display. The scan job settles it.
+    status: 'uploaded',
     sizeBytes: size,
     uploadedAt: new Date(),
     ...(messageId ? { messageId } : {}),
   });
 
   if (!updated) throw AppError.notFound('Attachment not found');
-  return updated;
+
+  await enqueue(JOB.attachmentScan, { attachmentId: id });
+  // As above: the response must not claim a status the row has moved past.
+  return (await repository.findById(id)) ?? updated;
 }
 
 export async function listForTicket(ticketId: string, actor: Actor): Promise<AttachmentRow[]> {
@@ -216,6 +231,15 @@ export async function download(
   if (row.status === 'pending') throw AppError.notFound('This attachment has not been uploaded');
   if (row.status === 'infected') {
     throw AppError.badRequest('This attachment was quarantined by the virus scanner');
+  }
+
+  // Still `uploaded` means the scan has not answered — either it is queued, or
+  // the scanner is down and pg-boss has exhausted its retries. Refusing is the
+  // right way round for a fintech support desk: an agent who cannot open a
+  // statement for a minute is an inconvenience, an agent who opens malware is
+  // an incident. `POST /attachments/:id/rescan` is the way out.
+  if (row.status === 'uploaded') {
+    throw AppError.conflict('This attachment has not finished being scanned yet');
   }
 
   const presigned = await presignDownload(row.storageKey, row.filename);
@@ -251,6 +275,160 @@ export async function remove(id: string, actor: Actor): Promise<void> {
   });
 }
 
+// -- scanning ----------------------------------------------------------------
+
+export interface ScanOutcome {
+  attachmentId: string;
+  status: 'clean' | 'infected' | 'skipped';
+  signature?: string;
+  reason?: string;
+}
+
+/**
+ * Scans one uploaded attachment and settles its status.
+ *
+ * Driven by the `attachment.scan` job. Deliberately **throws** when the scanner
+ * itself fails, rather than recording a verdict it did not reach: a throw is
+ * what makes pg-boss retry with backoff, and the alternative — writing
+ * `skipped` on a connection error — would quietly mark a real outage as
+ * "we chose not to scan this".
+ *
+ * Idempotent on anything already settled, because a retried job will see the
+ * verdict the previous attempt wrote.
+ */
+export async function scan(attachmentId: string): Promise<ScanOutcome> {
+  const row = await repository.findById(attachmentId);
+  if (!row) {
+    // Deleted between the enqueue and the run. Nothing to scan, nothing wrong.
+    return { attachmentId, status: 'skipped', reason: 'attachment no longer exists' };
+  }
+
+  if (row.status !== 'uploaded') {
+    return { attachmentId, status: 'skipped', reason: `already ${row.status}` };
+  }
+
+  if (antivirusDriver === 'none') {
+    await repository.update(attachmentId, { status: 'skipped' });
+    return { attachmentId, status: 'skipped', reason: 'no scanner is configured' };
+  }
+
+  const object = await getObject(row.storageKey, row.contentType);
+  const result = await scanBuffer(object.body);
+
+  if (result.verdict === 'failed') {
+    // Surfaces as a job failure so it is retried and then visible, rather than
+    // as a file nobody ever looked at.
+    throw new Error(`virus scan failed: ${result.reason ?? 'unknown'}`);
+  }
+
+  if (result.verdict === 'infected') {
+    await quarantine(row, result.signature ?? 'unknown');
+    return {
+      attachmentId,
+      status: 'infected',
+      ...(result.signature ? { signature: result.signature } : {}),
+    };
+  }
+
+  await repository.update(attachmentId, {
+    status: result.verdict === 'clean' ? 'clean' : 'skipped',
+  });
+
+  return {
+    attachmentId,
+    status: result.verdict,
+    ...(result.reason ? { reason: result.reason } : {}),
+  };
+}
+
+/**
+ * Marks an infected file and destroys the bytes.
+ *
+ * The row stays: an agent looking at the ticket has to be able to see that
+ * something was sent and quarantined, and — more importantly — that the
+ * customer's machine is probably compromised, which is a conversation somebody
+ * needs to have with them. Only the object is deleted.
+ */
+async function quarantine(row: AttachmentRow, signature: string): Promise<void> {
+  await withTransaction(async ({ tx, afterCommit }) => {
+    await repository.update(row.id, { status: 'infected' }, tx);
+
+    await auditService.record(
+      {
+        action: 'attachment.quarantined',
+        entityType: 'ticket',
+        entityId: row.ticketId,
+        after: { attachmentId: row.id, filename: row.filename, signature },
+      },
+      { kind: 'system', name: 'attachment.scan' },
+      tx,
+    );
+
+    afterCommit(async () => {
+      await deleteObject(row.storageKey).catch((error: unknown) => {
+        // The row already says `infected`, so the file is unreachable through
+        // the API whether or not the object survived.
+        log.error('failed to delete quarantined object', {
+          storageKey: row.storageKey,
+          err: error,
+        });
+      });
+
+      if (row.uploadedByUserId) {
+        await notificationService.notifyAttachmentQuarantined(row.uploadedByUserId, {
+          ticketId: row.ticketId,
+          filename: row.filename,
+          signature,
+        });
+      }
+    });
+  });
+
+  log.warn('attachment quarantined', {
+    attachmentId: row.id,
+    ticketId: row.ticketId,
+    signature,
+  });
+}
+
+/**
+ * Queues another scan by hand.
+ *
+ * Exists for the case the blocking rule above creates: the scanner was down when
+ * a file arrived, its retries are spent, and the attachment is stuck at
+ * `uploaded`. Without this the only remedy would be re-uploading a document the
+ * customer already sent.
+ */
+export async function requeueScan(id: string, actor: Actor): Promise<AttachmentRow> {
+  const row = await requireAccessible(id, actor);
+
+  if (row.status === 'pending') {
+    throw AppError.conflict('This attachment has not been uploaded yet');
+  }
+  if (row.status === 'infected') {
+    throw AppError.conflict('This attachment is quarantined and its content has been destroyed');
+  }
+
+  // Back to `uploaded` so the job has something to settle, whatever it said
+  // last time — a scanner with a fresh signature database may well disagree.
+  const reset = await repository.update(id, { status: 'uploaded' });
+  if (!reset) throw AppError.notFound('Attachment not found');
+
+  await auditService.recordSafely(
+    {
+      action: 'attachment.rescan_requested',
+      entityType: 'ticket',
+      entityId: row.ticketId,
+      before: { status: row.status },
+      after: { attachmentId: id, status: 'uploaded' },
+    },
+    actor,
+  );
+
+  await enqueue(JOB.attachmentScan, { attachmentId: id });
+  return (await repository.findById(id)) ?? reset;
+}
+
 /** Access to an attachment is access to its ticket. */
 async function requireAccessible(id: string, actor: Actor): Promise<AttachmentRow> {
   const row = await repository.findById(id);
@@ -258,4 +436,32 @@ async function requireAccessible(id: string, actor: Actor): Promise<AttachmentRo
 
   await ticketService.requireAccessible(row.ticketId, actor);
   return row;
+}
+
+// -- retention ---------------------------------------------------------------
+
+/**
+ * Deletes every attachment on these tickets, bytes first.
+ *
+ * Objects before rows, which is the opposite order to `remove()` above. There
+ * the priority is never leaving a broken download link; here it is never leaving
+ * a customer's document in a bucket after the row that pointed at it is gone —
+ * an orphaned object is exactly the thing a retention sweep exists to prevent.
+ *
+ * An object that will not delete is logged and its row is still removed: the
+ * alternative is a sweep that stalls on one bad key and never reaches the rest.
+ */
+export async function purgeForTickets(ticketIds: readonly string[]): Promise<number> {
+  const rows = await repository.listForTickets(ticketIds);
+
+  for (const row of rows) {
+    await deleteObject(row.storageKey).catch((error: unknown) => {
+      log.error('retention could not delete stored object', {
+        storageKey: row.storageKey,
+        err: error,
+      });
+    });
+  }
+
+  return repository.removeForTickets(ticketIds);
 }

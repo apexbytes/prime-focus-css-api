@@ -20,6 +20,14 @@ export async function listForProduct(
  * ticket could be filed under another product's taxonomy, which would quietly
  * corrupt every report that groups by category.
  */
+/**
+ * A category, or nothing. For callers that only want its name — reporting
+ * labels a bucket with it, and a deleted category is not an error there.
+ */
+export function findById(id: string): Promise<CategoryRow | undefined> {
+  return repository.findById(id);
+}
+
 export async function requireForProduct(
   categoryId: string,
   productId: string,

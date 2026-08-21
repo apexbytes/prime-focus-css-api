@@ -1,6 +1,8 @@
 import { AppError } from '../../common/errors/index.js';
+import { env } from '../../config/index.js';
 import type { Executor } from '../../db/transaction.js';
 import { createModuleLogger } from '../../lib/logger/index.js';
+import { notificationDigestEmail, sendEmail, webUrl } from '../../lib/resend/index.js';
 import type { NotificationPreferencesRow, NotificationRow } from './notification.model.js';
 import * as repository from './notification.repository.js';
 
@@ -11,6 +13,7 @@ const DEFAULT_PREFERENCES = {
   emailOnAssignment: true,
   emailOnCustomerReply: true,
   emailOnMention: true,
+  emailDigest: true,
 };
 
 export function list(
@@ -47,9 +50,13 @@ export function updatePreferences(
 }
 
 /**
- * In-app notifications only for now. Phase 4 adds the email fan-out behind the
- * queue, which is why the preference columns already exist — a notification that
- * has to be emailed synchronously would slow down the request that caused it.
+ * In-app only, still. What Phase 5 added is the *digest* — one email a morning
+ * summarising what is waiting — rather than an email per notification.
+ *
+ * That was the cheaper half of the trade and most of the value: an agent who
+ * lives in the console does not want six emails a day, and an agent who does not
+ * open it needs one. Per-event email fan-out remains a queue job away, which is
+ * what the `emailOn*` columns are still for.
  */
 async function create(
   input: {
@@ -160,6 +167,31 @@ export function notifyEscalation(
   );
 }
 
+/**
+ * Tells whoever uploaded a file that it was malware and is gone.
+ *
+ * The uploader rather than the assignee: usually an agent who forwarded
+ * something a customer sent them, and the thing they need to know is that the
+ * customer's machine is probably compromised.
+ */
+export function notifyAttachmentQuarantined(
+  userId: string,
+  input: { ticketId: string; filename: string; signature: string },
+  exec?: Executor,
+): Promise<void> {
+  return create(
+    {
+      userId,
+      type: 'attachment.quarantined',
+      title: `${input.filename} was quarantined`,
+      body: `The virus scanner reported ${input.signature}. The file has been deleted.`,
+      entityType: 'ticket',
+      entityId: input.ticketId,
+    },
+    exec,
+  );
+}
+
 export function notifyMention(
   userId: string,
   ticket: { id: string; reference: string },
@@ -176,4 +208,73 @@ export function notifyMention(
     },
     exec,
   );
+}
+
+// -- the daily digest --------------------------------------------------------
+
+export interface DigestResult {
+  candidates: number;
+  sent: number;
+  failed: number;
+}
+
+/** Breaching tickets listed per agent before the list stops being actionable. */
+const DIGEST_TICKET_LIMIT = 5;
+
+/**
+ * Sends each agent one email about what is waiting for them.
+ *
+ * Runs before the desk opens, so it is read on arrival rather than competing
+ * with the queue it is describing. Agents with nothing waiting are not emailed
+ * at all — a daily "you have nothing" is how a digest gets filtered away, taking
+ * the useful ones with it.
+ *
+ * One failure does not stop the rest: a bad address on one account must not cost
+ * everyone else their morning summary.
+ */
+export async function sendDailyDigest(): Promise<DigestResult> {
+  if (!env.NOTIFICATION_DIGEST_ENABLED) return { candidates: 0, sent: 0, failed: 0 };
+
+  const candidates = await repository.digestCandidates();
+  if (candidates.length === 0) return { candidates: 0, sent: 0, failed: 0 };
+
+  const breaching = await repository.breachingForUsers(candidates.map((row) => row.userId));
+  const byUser = new Map<string, { reference: string; subject: string }[]>();
+  for (const ticket of breaching) {
+    const list = byUser.get(ticket.userId) ?? [];
+    if (list.length < DIGEST_TICKET_LIMIT) {
+      list.push({ reference: ticket.reference, subject: ticket.subject });
+    }
+    byUser.set(ticket.userId, list);
+  }
+
+  let sent = 0;
+  let failed = 0;
+
+  for (const candidate of candidates) {
+    try {
+      const rendered = notificationDigestEmail({
+        fullName: candidate.fullName,
+        unreadNotifications: candidate.unreadNotifications,
+        assignedOpen: candidate.assignedOpen,
+        breaching: byUser.get(candidate.userId) ?? [],
+        consoleUrl: webUrl('/tickets', { assigned: 'me' }),
+      });
+
+      const result = await sendEmail({
+        ...rendered,
+        to: candidate.email,
+        kind: 'notification_digest',
+      });
+
+      if (result.delivered) sent += 1;
+      else failed += 1;
+    } catch (error) {
+      failed += 1;
+      log.error('digest could not be sent', { userId: candidate.userId, err: error });
+    }
+  }
+
+  log.info('notification digest sent', { candidates: candidates.length, sent, failed });
+  return { candidates: candidates.length, sent, failed };
 }

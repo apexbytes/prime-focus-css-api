@@ -9,6 +9,7 @@ import {
   downloadAttachment,
   listAttachments,
   putContent,
+  rescanAttachment,
 } from './attachment.controller.js';
 import {
   attachmentIdParams,
@@ -65,6 +66,14 @@ attachmentItemRouter.get(
   requirePermission('ticket:read'),
   validate({ params: attachmentIdParams }),
   downloadAttachment,
+);
+// `ticket:manage`, not `ticket:reply`: re-running a scan is what unsticks an
+// attachment the scanner never got to, which is an operational call.
+attachmentItemRouter.post(
+  '/:id/rescan',
+  requirePermission('ticket:manage'),
+  validate({ params: attachmentIdParams }),
+  rescanAttachment,
 );
 attachmentItemRouter.delete(
   '/:id',

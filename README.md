@@ -209,17 +209,178 @@ catch-all routing rule pointing at a `Support Desk` team, and a two-rung ladder
 that warns the desk at 80% of the first-response target and raises the priority
 on any breach. All of it is ordinary data — replace it through the API.
 
+## Deflection and insight
+
+### Knowledge base
+
+Articles are **drafted, reviewed, then published** — publishing is its own
+endpoint, not `PATCH { status: "published" }`, because it is a different decision
+from an edit. Editing a published article leaves it published; a correction should
+not take the answer offline. Every edit snapshots what the article said before it.
+
+```bash
+# write one (it starts as a draft, whatever you ask for)
+curl -sX POST localhost:3000/api/v1/kb/articles -H "authorization: Bearer $TOKEN" \
+  -H 'content-type: application/json' -d '{
+    "title": "Why a transfer can fail", "productId": "...", "visibility": "public",
+    "body": "Check the recipient number, the daily limit, then whether the wallet is dormant.",
+    "keywords": ["transfer", "limit"]
+  }'
+
+curl -sX POST localhost:3000/api/v1/kb/articles/$ID/publish -H "authorization: Bearer $TOKEN"
+```
+
+`visibility` is required and has no default, for the same reason message
+`visibility` does. `internal` articles are agent runbooks — escalation contacts,
+fraud procedure — and `GET /kb/suggest` exists to put text in front of customers.
+The column defaults to `internal` at the database level so anything that ever
+forgets the field fails closed.
+
+**Search and suggest are not the same query.** Postgres ANDs the terms of a
+search box, which is right for `?q=daily limit` and useless for a ticket body — a
+customer's paragraph ANDed together matches nothing ever written. So `suggest`
+reduces the text to its distinctive words, ORs them, and lets ranking decide.
+
+```bash
+# what an agent looks for, with runbooks included on request
+curl -s 'localhost:3000/api/v1/kb/search?q=dormant+wallet&includeInternal=true' \
+  -H "authorization: Bearer $TOKEN"
+
+# what the ticket form asks before the customer presses send:
+# published + public only, always, whoever is asking
+curl -s -G localhost:3000/api/v1/kb/suggest -H "authorization: Bearer $TOKEN" \
+  --data-urlencode 'subject=My transfer never arrived' \
+  --data-urlencode 'body=I sent $50 and it never came through'
+```
+
+"hello please help" returns nothing on purpose: an arbitrary article is worse
+than none. Ranking is weighted — a title match beats a keyword match beats a
+mention in the body — and results carry a `ts_headline` excerpt with the matched
+terms marked.
+
+Articles can be fetched by slug as well as id, because a knowledge base link
+pasted into a ticket is a slug. Readers vote once with
+`POST /kb/articles/:id/feedback`; changing your mind moves the counters rather
+than adding a second opinion.
+
+### Customer satisfaction
+
+A resolved ticket earns one emailed survey — five links, one per score, and the
+link lands on the console, which POSTs the rating. A GET that recorded a score
+would be cast by the first mail scanner to follow it.
+
+```bash
+# public, unauthenticated: the token from the email is the credential
+curl -s localhost:3000/api/v1/surveys/$TOKEN
+curl -sX POST localhost:3000/api/v1/surveys/$TOKEN \
+  -H 'content-type: application/json' -d '{"score":5,"comment":"Sorted in ten minutes."}'
+```
+
+The survey is sent an hour after resolution (`CSAT_DELAY_MINUTES`), and the
+ticket's state is re-read when the job runs — the delay is exactly the window in
+which a customer replies "that did not work" and reopens it. It is skipped, not
+failed, when there is nothing to rate: a ticket nobody replied to, one already
+surveyed, or a customer asked anything in the last `CSAT_CUSTOMER_COOLDOWN_DAYS`.
+Being asked five times about five tickets is how a response rate reaches zero.
+
+It answers once, expires after `CSAT_TOKEN_TTL_DAYS`, and the token is stored as
+an HMAC digest like every other bearer value here.
+
+### Reports
+
+Dashboards read **six materialised views**, rebuilt every fifteen minutes, never
+the live ticket tables. Every response says how stale it is.
+
+```bash
+curl -s localhost:3000/api/v1/reports/overview -H "authorization: Bearer $TOKEN"
+curl -s 'localhost:3000/api/v1/reports/sla?from=2026-08-01' -H "authorization: Bearer $TOKEN"
+curl -s localhost:3000/api/v1/reports/agents -H "authorization: Bearer $TOKEN"
+curl -s localhost:3000/api/v1/reports/csat -H "authorization: Bearer $TOKEN"
+curl -s localhost:3000/api/v1/reports/volume -H "authorization: Bearer $TOKEN"
+
+# rebuild now instead of waiting for the schedule (perm report:refresh)
+curl -sX POST localhost:3000/api/v1/reports/refresh -H "authorization: Bearer $TOKEN"
+```
+
+`meta.refreshedAt` is the **oldest** refresh across the views a report reads, and
+`meta.stale` is true if any of them failed — taking the newest would hide a view
+that has been broken for a week behind one that succeeded a minute ago.
+
+Reports are product-scoped like everything else: `report:view` is held by tier-2
+specialists, who only see the products they work. Durations in the views are wall
+clock, because a materialised view cannot call the SLA clock; anything answering
+to a service level comes from `/reports/sla`, which reads the targets the clock
+itself wrote. Compliance is `met ÷ (met + breached)` — a ticket still inside its
+deadline is neither, and counting it either way would make this morning's figure
+depend on the time of day.
+
+The views bucket by **local** calendar day, with `Africa/Harare` baked into the
+migration. Changing `DEFAULT_TIMEZONE` means a migration to match.
+
+### Attachment scanning
+
+Uploaded bytes land as `uploaded` and the `attachment.scan` job settles them.
+**A download is refused while a scan has not answered** — an agent who cannot
+open a statement for a minute is an inconvenience, an agent who opens malware is
+an incident.
+
+```bash
+# a scanner outage leaves a file stuck; this unsticks it (perm ticket:manage)
+curl -sX POST localhost:3000/api/v1/attachments/$ID/rescan -H "authorization: Bearer $TOKEN"
+```
+
+With no scanner configured, uploads are recorded as `skipped` — honest about the
+fact that nothing looked at them — and `/readyz` reports the scanner as
+`not_configured` rather than `ok`. Point `ANTIVIRUS_HOST` at a clamd instance to
+turn it on; production refuses to boot without either that or an explicit
+`ANTIVIRUS_DRIVER=none`. The `.exe` denylist stays either way: a scanner asks
+whether a file is known malware, the denylist asks whether a customer has any
+reason to send it.
+
+### Data retention
+
+Zimbabwe's Cyber and Data Protection Act (2021) shapes what is kept: the audit
+trail for seven years, ticket content for five, after which customer personal
+data is anonymised **in place** rather than deleted, so five-year-old volume
+figures do not change retroactively. Attachments are the exception and are
+deleted outright — a stored document is the personal data, so there is nothing
+left to anonymise once the file is gone.
+
+```bash
+# what the policy is, and what is currently past it (perm audit:read)
+curl -s localhost:3000/api/v1/retention/policy -H "authorization: Bearer $TOKEN"
+
+# a dry run, which is what an empty body gets you
+curl -sX POST localhost:3000/api/v1/retention/sweep -H "authorization: Bearer $TOKEN" \
+  -H 'content-type: application/json' -d '{}'
+
+# actually do it (perm retention:run — super_admin only by default)
+curl -sX POST localhost:3000/api/v1/retention/sweep -H "authorization: Bearer $TOKEN" \
+  -H 'content-type: application/json' -d '{"dryRun":false}'
+```
+
+`dryRun` defaults to **true**, unlike every other flag in this API: an operator
+POSTing an empty body to see what an endpoint does should get a report, not a
+deletion. The weekly cron runs for real. `RETENTION_AUDIT_LOG_YEARS` below
+`RETENTION_TICKET_YEARS` is refused rather than clamped — it would delete the
+record of an anonymisation before performing it.
+
 ### Async jobs
 
 Jobs run on **pg-boss**, in the same process that serves HTTP, against its own
 `pgboss` schema. `/readyz` reports the queue alongside Postgres.
 
-| Job                 | Trigger            | Does                                      |
-| ------------------- | ------------------ | ----------------------------------------- |
-| `ticket.triage`     | ticket created     | matches routing rules, sets the team      |
-| `ticket.autoassign` | after triage       | picks an agent, or leaves it queued       |
-| `sla.scan`          | cron, every minute | records breaches, hands off to the ladder |
-| `sla.escalate`      | from the scan      | fires escalation rungs                    |
+| Job                   | Trigger                  | Does                                            |
+| --------------------- | ------------------------ | ----------------------------------------------- |
+| `ticket.triage`       | ticket created           | matches routing rules, sets the team            |
+| `ticket.autoassign`   | after triage             | picks an agent, or leaves it queued             |
+| `sla.scan`            | cron, every minute       | records breaches, hands off to the ladder       |
+| `sla.escalate`        | from the scan            | fires escalation rungs                          |
+| `survey.dispatch`     | ticket resolved, delayed | emails the CSAT survey, or skips it             |
+| `attachment.scan`     | bytes uploaded           | settles an attachment to clean/infected/skipped |
+| `report.refresh`      | cron, every 15 min       | rebuilds the six reporting views                |
+| `notification.digest` | cron, 07:00 CAT          | one email an agent about what is waiting        |
+| `retention.sweep`     | cron, Sundays 03:00      | enforces the retention policy, one batch        |
 
 `QUEUE_DRIVER=inline` runs a job the moment it is enqueued and **fires no
 schedule**. Tests use it, so the job path is the path under test; setting it

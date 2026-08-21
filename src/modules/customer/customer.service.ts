@@ -18,6 +18,15 @@ export function findByEmail(email: string, exec?: Executor): Promise<CustomerRow
   return repository.findByEmail(normaliseEmail(email), exec);
 }
 
+/**
+ * A customer, or nothing. For callers where absence is an ordinary outcome
+ * rather than a 404 — a survey dispatch that finds the record deleted skips the
+ * survey, it does not fail.
+ */
+export function findById(id: string, exec?: Executor): Promise<CustomerRow | undefined> {
+  return repository.findById(id, exec);
+}
+
 export async function requireById(id: string): Promise<CustomerRow> {
   const customer = await repository.findById(id);
   if (!customer) throw AppError.notFound('Customer not found');
@@ -253,4 +262,38 @@ export async function merge(
   });
 
   return get(survivorId);
+}
+
+// -- retention ---------------------------------------------------------------
+
+/**
+ * Anonymises customers with nothing on file since the cutoff.
+ *
+ * Returns how many it touched so the sweep can report progress and stop when a
+ * batch comes back short. No actor: this is a scheduled obligation, not
+ * something a person decides customer by customer.
+ */
+export async function anonymiseDormant(before: Date, limit: number): Promise<number> {
+  const dormant = await repository.listDormantBefore(before, limit);
+
+  for (const customer of dormant) {
+    await withTransaction(async ({ tx }) => {
+      await repository.anonymise(customer.id, tx);
+
+      // The audit row names the customer being anonymised and nothing else:
+      // recording the email we just removed would defeat the exercise.
+      await auditService.record(
+        {
+          action: 'customer.anonymised',
+          entityType: 'customer',
+          entityId: customer.id,
+          after: { reason: 'data retention period elapsed' },
+        },
+        { kind: 'system', name: 'retention.sweep' },
+        tx,
+      );
+    });
+  }
+
+  return dormant.length;
 }

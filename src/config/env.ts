@@ -166,6 +166,71 @@ export const envSchema = z.object({
   /** Open tickets an agent may hold before routing skips them. */
   DEFAULT_AGENT_MAX_OPEN_TICKETS: z.coerce.number().int().min(1).max(500).default(20),
 
+  // ---- knowledge base ------------------------------------------------------
+  /** Articles offered by `GET /kb/suggest` during the ticket-creation flow. */
+  KB_SUGGEST_LIMIT: z.coerce.number().int().min(1).max(20).default(5),
+
+  // ---- customer satisfaction (CSAT) ----------------------------------------
+  /** Off sends nothing; the surveys already dispatched stay answerable. */
+  CSAT_ENABLED: booleanish.default(true),
+  /**
+   * Delay between resolving a ticket and asking about it. Long enough that a
+   * customer who is about to reply "that did not work" reopens the ticket
+   * instead of rating a resolution that did not hold.
+   */
+  CSAT_DELAY_MINUTES: z.coerce.number().int().min(0).max(10_080).default(60),
+  /** How long the rating link stays usable. */
+  CSAT_TOKEN_TTL_DAYS: z.coerce.number().int().min(1).max(90).default(14),
+  /**
+   * Minimum gap between surveys to the same customer. A customer who raises
+   * five tickets in a week must not be asked five times.
+   */
+  CSAT_CUSTOMER_COOLDOWN_DAYS: z.coerce.number().int().min(0).max(365).default(7),
+
+  // ---- reporting -----------------------------------------------------------
+  /**
+   * How often the materialised views are rebuilt. Every 15 minutes: dashboards
+   * are read constantly and a report is allowed to be a quarter of an hour
+   * behind, which is what keeps reporting off the transactional query path.
+   */
+  REPORT_REFRESH_CRON: z.string().min(1).default('*/15 * * * *'),
+
+  // ---- attachment scanning -------------------------------------------------
+  /**
+   * `none` records uploads as `skipped` — honest about the fact that nothing
+   * looked at them. Derived as `clamav` once a host is configured.
+   */
+  ANTIVIRUS_DRIVER: z.enum(['clamav', 'none']).optional(),
+  /** clamd host. TCP rather than a unix socket so the scanner can be its own container. */
+  ANTIVIRUS_HOST: z.string().min(1).optional(),
+  ANTIVIRUS_PORT: z.coerce.number().int().min(1).max(65535).default(3310),
+  ANTIVIRUS_TIMEOUT_MS: z.coerce.number().int().min(1000).max(600_000).default(30_000),
+  /** Must not exceed clamd's own StreamMaxLength, or it closes the connection. */
+  ANTIVIRUS_MAX_BYTES: z.coerce
+    .number()
+    .int()
+    .min(1024)
+    .default(25 * 1024 * 1024),
+
+  // ---- notification digest -------------------------------------------------
+  /** 07:00 in DEFAULT_TIMEZONE: before the desk opens, so it is read on arrival. */
+  NOTIFICATION_DIGEST_CRON: z.string().min(1).default('0 7 * * *'),
+  NOTIFICATION_DIGEST_ENABLED: booleanish.default(true),
+
+  // ---- data retention ------------------------------------------------------
+  /**
+   * Zimbabwe's Cyber and Data Protection Act (2021) shapes these: the audit
+   * trail is kept for seven years, ticket content for five, after which the
+   * customer's personal data is anonymised in place rather than deleted, so
+   * aggregate reporting survives.
+   */
+  RETENTION_SWEEP_CRON: z.string().min(1).default('0 3 * * 0'),
+  RETENTION_SWEEP_ENABLED: booleanish.default(true),
+  RETENTION_AUDIT_LOG_YEARS: z.coerce.number().int().min(1).max(50).default(7),
+  RETENTION_TICKET_YEARS: z.coerce.number().int().min(1).max(50).default(5),
+  /** Rows touched per sweep, so a first run on an old database is not one huge statement. */
+  RETENTION_SWEEP_BATCH_SIZE: z.coerce.number().int().min(1).max(50_000).default(500),
+
   // ---- seed ----------------------------------------------------------------
   SEED_ADMIN_EMAIL: z.string().min(3).default('admin@primefocus.co.zw'),
   SEED_ADMIN_NAME: z.string().min(1).default('Prime Focus Administrator'),
@@ -207,6 +272,17 @@ const productionSchema = envSchema.superRefine((value, ctx) => {
       code: 'custom',
       path: ['RESEND_WEBHOOK_SECRET'],
       message: 'is required in production to verify inbound email webhooks',
+    });
+  }
+
+  // An unscanned attachment store is a malware distribution channel with a
+  // support desk attached. Opting out is allowed, but it has to be deliberate.
+  if (!value.ANTIVIRUS_HOST && value.ANTIVIRUS_DRIVER !== 'none') {
+    ctx.addIssue({
+      code: 'custom',
+      path: ['ANTIVIRUS_HOST'],
+      message:
+        'is required in production (or set ANTIVIRUS_DRIVER=none to accept unscanned attachments deliberately)',
     });
   }
 
@@ -269,6 +345,13 @@ export const emailTransport: 'resend' | 'log' =
  */
 export const queueDriver: 'pgboss' | 'inline' =
   env.QUEUE_DRIVER ?? (env.NODE_ENV === 'test' ? 'inline' : 'pgboss');
+
+/**
+ * `clamav` once a scanner host is configured, otherwise `none`, which records
+ * every upload as `skipped` rather than claiming it is clean.
+ */
+export const antivirusDriver: 'clamav' | 'none' =
+  env.ANTIVIRUS_DRIVER ?? (env.ANTIVIRUS_HOST ? 'clamav' : 'none');
 
 /**
  * `s3` once a bucket and credentials exist, otherwise the local-disk backend so

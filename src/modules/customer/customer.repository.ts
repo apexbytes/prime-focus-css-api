@@ -165,3 +165,59 @@ export async function reassignTickets(
 
   return (result as unknown as { rowCount?: number }).rowCount ?? 0;
 }
+
+// -- retention ---------------------------------------------------------------
+
+/**
+ * Customers with no activity since the cutoff.
+ *
+ * `not exists` rather than a join on the newest ticket: a customer with one
+ * recent ticket and fifty old ones must not be anonymised, and the correlated
+ * subquery says exactly that. Already-anonymised rows carry `deleted_at`, which
+ * is what keeps the batch moving forward.
+ */
+export function listDormantBefore(
+  before: Date,
+  limit: number,
+  exec: Executor = db,
+): Promise<CustomerRow[]> {
+  return exec
+    .select()
+    .from(customers)
+    .where(
+      and(
+        isNull(customers.deletedAt),
+        sql`${customers.createdAt} < ${before}`,
+        sql`not exists (
+          select 1 from tickets t
+          where t.customer_id = ${customers.id}
+            and (t.resolved_at is null or t.resolved_at >= ${before})
+        )`,
+      ),
+    )
+    .orderBy(asc(customers.createdAt))
+    .limit(limit);
+}
+
+/**
+ * Strips a customer's personal data, keeping the row.
+ *
+ * In place rather than deleted, because every ticket they ever raised points at
+ * it: deleting the row would either cascade away five years of volume figures or
+ * fail on the foreign key. The email is rewritten into the reserved `.invalid`
+ * domain so it stays unique, stays obviously synthetic, and can never be
+ * delivered to.
+ */
+export async function anonymise(id: string, exec: Executor = db): Promise<void> {
+  await exec
+    .update(customers)
+    .set({
+      email: `redacted+${id}@retention.invalid`,
+      fullName: 'Redacted customer',
+      phone: null,
+      notes: null,
+      externalRefs: null,
+      deletedAt: new Date(),
+    })
+    .where(eq(customers.id, id));
+}

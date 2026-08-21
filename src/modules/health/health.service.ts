@@ -1,5 +1,6 @@
 import { env, SERVICE_NAME } from '../../config/index.js';
 import { checkDatabaseConnection } from '../../db/client.js';
+import { checkAntivirus } from '../../lib/antivirus/index.js';
 import { checkQueue } from '../../lib/queue/index.js';
 import { isShuttingDown } from '../../common/utils/lifecycle.js';
 import type { DependencyStatus, LivenessReport, ReadinessReport } from './health.types.js';
@@ -40,6 +41,24 @@ async function checkJobQueue(): Promise<DependencyStatus> {
 }
 
 /**
+ * The virus scanner.
+ *
+ * `not_configured` under the `none` driver, following the queue's `inline`: the
+ * process is serviceable, but an operator reading this should be able to see
+ * that nothing is looking at uploads. A scanner that *is* configured and
+ * unreachable does fail readiness — attachments become undownloadable while it
+ * is down, so an instance in that state is not fully serving.
+ */
+async function checkScanner(): Promise<DependencyStatus> {
+  const result = await checkAntivirus();
+  return {
+    name: 'antivirus',
+    state: result.state,
+    ...(result.error ? { error: result.error } : {}),
+  };
+}
+
+/**
  * Readiness answers "should this instance receive traffic". Dependencies added
  * in later phases register here: Resend still reports `not_configured`.
  *
@@ -48,7 +67,11 @@ async function checkJobQueue(): Promise<DependencyStatus> {
  * not — and does not fail the probe.
  */
 export async function getReadiness(): Promise<ReadinessReport> {
-  const dependencies: DependencyStatus[] = await Promise.all([checkDatabase(), checkJobQueue()]);
+  const dependencies: DependencyStatus[] = await Promise.all([
+    checkDatabase(),
+    checkJobQueue(),
+    checkScanner(),
+  ]);
 
   dependencies.push({ name: 'resend', state: 'not_configured' });
 
