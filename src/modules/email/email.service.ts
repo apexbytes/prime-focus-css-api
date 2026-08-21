@@ -6,6 +6,8 @@ import { withTransaction, type Executor } from '../../db/transaction.js';
 import { createModuleLogger } from '../../lib/logger/index.js';
 import { sendEmail, ticketAcknowledgementEmail } from '../../lib/resend/index.js';
 import * as customerService from '../customer/customer.service.js';
+import * as eventService from '../event/event.service.js';
+import { DOMAIN_EVENT } from '../event/event.types.js';
 import * as messageService from '../message/message.service.js';
 import type { TicketMessageRow } from '../message/message.types.js';
 import * as notificationService from '../notification/notification.service.js';
@@ -385,6 +387,19 @@ async function fileInbound(inboundId: string, input: FilingInput): Promise<Inbou
       );
 
       afterCommit(async () => {
+        // The customer replying is the event a partner system most wants: it is
+        // what turns a ticket the agent thought finished back into work.
+        await eventService.publish({
+          type: DOMAIN_EVENT.messageCreated,
+          ticket,
+          data: {
+            messageId: message.id,
+            visibility: message.visibility,
+            authorType: message.authorType,
+            authorUserId: null,
+          },
+        });
+
         if (ticket.assignedToUserId) {
           await notificationService.notifyCustomerReply(ticket.assignedToUserId, ticket);
         }

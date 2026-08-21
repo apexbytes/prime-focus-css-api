@@ -43,6 +43,14 @@ export const envSchema = z.object({
   /** Tighter budget for credential endpoints, where guessing has a payoff. */
   AUTH_RATE_LIMIT_WINDOW_MS: z.coerce.number().int().min(1000).default(900_000),
   AUTH_RATE_LIMIT_MAX: z.coerce.number().int().min(1).default(10),
+  /**
+   * A product system's own budget, keyed on its API key rather than its IP.
+   * Higher than the per-IP limit on purpose: an integration is expected to be
+   * chatty, and it must not spend the budget shared by every browser behind the
+   * same corporate NAT.
+   */
+  API_KEY_RATE_LIMIT_WINDOW_MS: z.coerce.number().int().min(1000).default(60_000),
+  API_KEY_RATE_LIMIT_MAX: z.coerce.number().int().min(1).default(1_000),
 
   SHUTDOWN_TIMEOUT_MS: z.coerce.number().int().min(0).default(15_000),
   READINESS_CHECK_TIMEOUT_MS: z.coerce.number().int().min(100).default(3_000),
@@ -231,6 +239,61 @@ export const envSchema = z.object({
   /** Rows touched per sweep, so a first run on an old database is not one huge statement. */
   RETENTION_SWEEP_BATCH_SIZE: z.coerce.number().int().min(1).max(50_000).default(500),
 
+  // ---- cache & shared state ------------------------------------------------
+  /**
+   * Without it the cache, the rate-limit counters and the socket fan-out are
+   * per-process, which is correct for one instance and quietly wrong for two.
+   * Derived: `redis` once a URL is set, otherwise `memory`.
+   */
+  REDIS_URL: z.string().min(1).optional(),
+  CACHE_DRIVER: z.enum(['redis', 'memory']).optional(),
+  /** Namespace on a shared Redis, so two environments cannot read each other. */
+  REDIS_KEY_PREFIX: z.string().min(1).default('pfcss:'),
+  REDIS_CONNECT_TIMEOUT_MS: z.coerce.number().int().min(100).max(60_000).default(5_000),
+  /**
+   * How long a cached knowledge base suggestion stays usable. Short: an article
+   * unpublished for being wrong must stop being offered within the minute.
+   */
+  KB_SUGGEST_CACHE_TTL_SECONDS: z.coerce.number().int().min(0).max(3600).default(60),
+
+  // ---- realtime ------------------------------------------------------------
+  /** Off serves the REST API alone; the console falls back to polling. */
+  REALTIME_ENABLED: booleanish.default(true),
+  /** Socket.IO mount path. Distinct from any REST route, and proxied as-is. */
+  REALTIME_PATH: z.string().min(1).default('/realtime'),
+  /**
+   * How long a ticket lock survives without a heartbeat. Deliberately short: a
+   * lock is advisory, and the failure mode to avoid is a closed laptop making a
+   * customer's ticket look owned for the rest of the afternoon.
+   */
+  TICKET_LOCK_TTL_SECONDS: z.coerce.number().int().min(15).max(3600).default(120),
+  /** How often the client should refresh a lock it still holds. */
+  TICKET_LOCK_HEARTBEAT_SECONDS: z.coerce.number().int().min(5).max(600).default(30),
+  /**
+   * How often an open socket re-checks that its account is still active. The
+   * REST path re-reads the user row on every request, so a suspension takes
+   * effect immediately there; a socket authenticated once at handshake would
+   * otherwise stay live all afternoon.
+   */
+  REALTIME_REAUTH_SECONDS: z.coerce.number().int().min(30).max(3600).default(300),
+
+  // ---- outbound webhooks ---------------------------------------------------
+  /** A receiver that has not answered by now is treated as a failed attempt. */
+  WEBHOOK_TIMEOUT_MS: z.coerce.number().int().min(1000).max(60_000).default(10_000),
+  /** Attempts per delivery, including the first. */
+  WEBHOOK_MAX_ATTEMPTS: z.coerce.number().int().min(1).max(20).default(5),
+  /**
+   * Consecutive failed deliveries before a subscription is disabled. A host
+   * that was decommissioned without anyone deleting its subscription would
+   * otherwise be retried for every event forever.
+   */
+  WEBHOOK_DISABLE_AFTER_FAILURES: z.coerce.number().int().min(1).max(1000).default(20),
+  /**
+   * Delivery log rows are operational debris, not business records: they are
+   * swept on the same schedule as everything else with a retention period.
+   */
+  WEBHOOK_DELIVERY_RETENTION_DAYS: z.coerce.number().int().min(1).max(365).default(30),
+
   // ---- seed ----------------------------------------------------------------
   SEED_ADMIN_EMAIL: z.string().min(3).default('admin@primefocus.co.zw'),
   SEED_ADMIN_NAME: z.string().min(1).default('Prime Focus Administrator'),
@@ -295,6 +358,19 @@ const productionSchema = envSchema.superRefine((value, ctx) => {
     });
   }
 
+  // Rate-limit counters, cached permissions and socket rooms all live in
+  // process memory without it. One instance behaves; two disagree about who is
+  // over their limit and never see each other's broadcasts, which is a bug that
+  // only appears under the load that made you scale out.
+  if (!value.REDIS_URL && value.CACHE_DRIVER !== 'memory') {
+    ctx.addIssue({
+      code: 'custom',
+      path: ['REDIS_URL'],
+      message:
+        'is required in production (or set CACHE_DRIVER=memory to run a single instance deliberately)',
+    });
+  }
+
   if (value.CORS_ORIGINS.trim() === '*') {
     ctx.addIssue({
       code: 'custom',
@@ -352,6 +428,16 @@ export const queueDriver: 'pgboss' | 'inline' =
  */
 export const antivirusDriver: 'clamav' | 'none' =
   env.ANTIVIRUS_DRIVER ?? (env.ANTIVIRUS_HOST ? 'clamav' : 'none');
+
+/**
+ * `redis` once a URL is configured, otherwise `memory`, which keeps development
+ * and the test suite free of a second service to run. The memory driver is
+ * honest rather than equivalent: its cache, rate-limit counters and socket
+ * rooms are per-process, so it reports `not_configured` on `/readyz` and is
+ * refused in production unless chosen explicitly.
+ */
+export const cacheDriver: 'redis' | 'memory' =
+  env.CACHE_DRIVER ?? (env.REDIS_URL ? 'redis' : 'memory');
 
 /**
  * `s3` once a bucket and credentials exist, otherwise the local-disk backend so

@@ -36,6 +36,13 @@
       "when": 1787320453478,
       "tag": "0004_phase5_deflection_insight",
       "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "7",
+      "when": 1787325578929,
+      "tag": "0005_phase6_realtime_scale",
+      "breakpoints": true
     }
   ]
 }

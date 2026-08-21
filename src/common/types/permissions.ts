@@ -95,6 +95,17 @@ export const PERMISSION_CATALOGUE = [
     description: 'Rebuild the reporting views by hand instead of waiting for the schedule',
     category: 'reporting',
   },
+  // outbound webhooks (Phase 6)
+  {
+    code: 'webhook:read',
+    description: 'View outbound webhook subscriptions and their delivery log',
+    category: 'webhooks',
+  },
+  {
+    code: 'webhook:manage',
+    description: 'Create and delete outbound webhook subscriptions, and redeliver events to them',
+    category: 'webhooks',
+  },
   // retention (Phase 5)
   {
     code: 'retention:run',
@@ -161,6 +172,10 @@ export const SYSTEM_ROLES: readonly SystemRoleDefinition[] = [
       'sla:manage',
       'report:view',
       'report:refresh',
+      // Alongside `api_key:manage`, and for the same reason: a subscription is
+      // an egress of ticket data to a host of the holder's choosing.
+      'webhook:read',
+      'webhook:manage',
     ],
   },
   {

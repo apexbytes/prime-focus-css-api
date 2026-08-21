@@ -4,6 +4,7 @@ import { authenticate, requirePermission, requireUserActor } from '../auth/auth.
 import { attachmentRouter } from '../attachment/attachment.routes.js';
 import { ticketEscalationRouter } from '../escalation/escalation.routes.js';
 import { messageRouter } from '../message/message.routes.js';
+import { ticketLockRouter } from '../realtime/realtime.routes.js';
 import { ticketRoutingRouter } from '../routing/routing.routes.js';
 import { ticketSlaRouter } from '../sla/sla.routes.js';
 import { ticketSurveyRouter } from '../survey/survey.routes.js';
@@ -123,3 +124,4 @@ ticketRouter.use('/:ticketId/sla', ticketSlaRouter);
 ticketRouter.use('/:ticketId/escalations', ticketEscalationRouter);
 ticketRouter.use('/:ticketId/routing', ticketRoutingRouter);
 ticketRouter.use('/:ticketId/survey', ticketSurveyRouter);
+ticketRouter.use('/:ticketId/lock', ticketLockRouter);

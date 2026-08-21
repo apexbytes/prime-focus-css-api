@@ -18,6 +18,7 @@ export const JOB = {
   reportRefresh: 'report.refresh',
   notificationDigest: 'notification.digest',
   retentionSweep: 'retention.sweep',
+  webhookDeliver: 'webhook.deliver',
 } as const;
 
 export type JobName = (typeof JOB)[keyof typeof JOB];
@@ -69,6 +70,12 @@ export interface EnqueueOptions {
    * while one is still queued, is discarded rather than duplicated.
    */
   singletonKey?: string;
+  /**
+   * Overrides the global retry limit for one job. Outbound webhook delivery
+   * uses it: a receiver having a bad afternoon deserves more attempts than an
+   * internal job whose failure means a bug.
+   */
+  retryLimit?: number;
 }
 
 /**
@@ -98,7 +105,7 @@ export async function enqueue<T extends object>(
     await boss.send(name, payload, {
       ...(options.startAfterSeconds ? { startAfter: options.startAfterSeconds } : {}),
       ...(options.singletonKey ? { singletonKey: options.singletonKey } : {}),
-      retryLimit: env.QUEUE_RETRY_LIMIT,
+      retryLimit: options.retryLimit ?? env.QUEUE_RETRY_LIMIT,
       retryBackoff: true,
       expireInSeconds: env.QUEUE_JOB_EXPIRY_SECONDS,
     });

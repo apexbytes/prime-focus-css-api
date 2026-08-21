@@ -3,6 +3,7 @@ import { env } from '../../config/index.js';
 import type { Executor } from '../../db/transaction.js';
 import { createModuleLogger } from '../../lib/logger/index.js';
 import { notificationDigestEmail, sendEmail, webUrl } from '../../lib/resend/index.js';
+import * as realtimeService from '../realtime/realtime.service.js';
 import type { NotificationPreferencesRow, NotificationRow } from './notification.model.js';
 import * as repository from './notification.repository.js';
 
@@ -50,13 +51,18 @@ export function updatePreferences(
 }
 
 /**
- * In-app only, still. What Phase 5 added is the *digest* — one email a morning
- * summarising what is waiting — rather than an email per notification.
+ * In-app, plus a push to any open console. Phase 5 added the *digest* — one
+ * email a morning summarising what is waiting — rather than an email per
+ * notification: an agent who lives in the console does not want six emails a
+ * day, and an agent who does not open it needs one. Per-event email fan-out
+ * remains a queue job away, which is what the `emailOn*` columns are still for.
  *
- * That was the cheaper half of the trade and most of the value: an agent who
- * lives in the console does not want six emails a day, and an agent who does not
- * open it needs one. Per-event email fan-out remains a queue job away, which is
- * what the `emailOn*` columns are still for.
+ * The push is deliberately not deferred to after commit. Most callers are
+ * already in an `afterCommit` hook; the few that pass a transaction would, on a
+ * rollback, have pushed a badge for a notification that no longer exists — and
+ * the console re-reads the list on the next request, so the badge corrects
+ * itself. Holding a websocket push behind a commit hook that the caller may not
+ * have is a worse trade than a badge that is briefly one too high.
  */
 async function create(
   input: {
@@ -70,7 +76,7 @@ async function create(
   exec?: Executor,
 ): Promise<void> {
   try {
-    await repository.insert(
+    const row = await repository.insert(
       {
         userId: input.userId,
         type: input.type,
@@ -81,6 +87,19 @@ async function create(
       },
       exec,
     );
+
+    // Straight to whichever of that agent's tabs are open, so the unread badge
+    // moves without a poll. Fire-and-forget: the row is the record, and a
+    // console that missed the push sees it on its next read either way.
+    realtimeService.emitToUser(input.userId, {
+      id: row.id,
+      type: row.type,
+      title: row.title,
+      body: row.body,
+      entityType: row.entityType,
+      entityId: row.entityId,
+      createdAt: row.createdAt,
+    });
   } catch (error) {
     // A failed notification must never fail the action that triggered it.
     log.error('failed to create notification', { type: input.type, err: error });

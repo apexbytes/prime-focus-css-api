@@ -7,6 +7,7 @@ import { registerRetentionJobs } from '../modules/retention/index.js';
 import { registerRoutingJobs } from '../modules/routing/index.js';
 import { registerSlaJobs } from '../modules/sla/index.js';
 import { registerSurveyJobs } from '../modules/survey/index.js';
+import { registerWebhookJobs } from '../modules/webhook/index.js';
 
 const log = createModuleLogger('workers');
 
@@ -41,6 +42,7 @@ export function registerJobHandlers(): void {
   registerReportJobs();
   registerNotificationJobs();
   registerRetentionJobs();
+  registerWebhookJobs();
 
   log.debug('job handlers registered');
 }

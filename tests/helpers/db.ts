@@ -3,6 +3,7 @@ import { db } from '../../src/db/client.js';
 import { seedCatalogue } from '../../src/db/seeds/catalogue.js';
 import { seedPermissions, seedRoles } from '../../src/db/seeds/identity.js';
 import { seedServiceLevels } from '../../src/db/seeds/service-levels.js';
+import { clearMemoryCache } from '../../src/lib/cache/index.js';
 import { clearOutbox } from '../../src/lib/resend/index.js';
 import { invalidatePermissionCache } from '../../src/modules/role/role.service.js';
 import { invalidateCalendarCache } from '../../src/modules/sla/sla.service.js';
@@ -13,6 +14,9 @@ import { invalidateCalendarCache } from '../../src/modules/sla/sla.service.js';
  */
 const TABLES = [
   'audit_logs',
+  'webhook_deliveries',
+  'webhook_subscriptions',
+  'ticket_locks',
   'report_refreshes',
   'csat_surveys',
   'kb_views',
@@ -87,5 +91,8 @@ export async function resetDatabase(): Promise<void> {
   invalidatePermissionCache();
   // Calendars are cached in-process and truncation gives them new ids.
   invalidateCalendarCache();
+  // The knowledge base's suggestion cache outlives a truncate otherwise, and a
+  // spec that publishes an article would be answered from the previous file's.
+  clearMemoryCache();
   clearOutbox();
 }

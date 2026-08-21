@@ -7,6 +7,8 @@ import { createModuleLogger } from '../../lib/logger/index.js';
 import * as auditService from '../audit/audit.service.js';
 import * as customerService from '../customer/customer.service.js';
 import * as emailService from '../email/email.service.js';
+import * as eventService from '../event/event.service.js';
+import { DOMAIN_EVENT } from '../event/event.types.js';
 import * as notificationService from '../notification/notification.service.js';
 import * as ticketService from '../ticket/ticket.service.js';
 import * as userService from '../user/user.service.js';
@@ -106,6 +108,20 @@ export async function postAgentMessage(
     );
 
     afterCommit(async () => {
+      // Metadata only — never the body. An internal note is agent-only, and a
+      // webhook is an egress its author never saw; `visibility` travels with
+      // the event so a receiver can tell the two apart.
+      await eventService.publish({
+        type: DOMAIN_EVENT.messageCreated,
+        ticket,
+        data: {
+          messageId: row.id,
+          visibility: row.visibility,
+          authorType: row.authorType,
+          authorUserId: row.authorUserId,
+        },
+      });
+
       await notifyMentions(input.body, ticket, actor, row);
 
       if (input.visibility === 'public') {

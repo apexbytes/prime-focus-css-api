@@ -2,6 +2,7 @@ import { AppError, ErrorCode } from '../../common/errors/index.js';
 import type { Actor } from '../../common/types/actor.js';
 import { SUPER_ADMIN_ROLE_CODE, type PermissionCode } from '../../common/types/permissions.js';
 import { withTransaction, type Executor } from '../../db/transaction.js';
+import { publishSignal, SIGNAL } from '../../lib/cache/index.js';
 import { createModuleLogger } from '../../lib/logger/index.js';
 import * as auditService from '../audit/audit.service.js';
 import * as repository from './role.repository.js';
@@ -16,14 +17,31 @@ const log = createModuleLogger('role');
 
 /**
  * Permission lookups happen on every authenticated request, so the role → codes
- * mapping is cached in-process. The TTL is short because a revoked permission
- * that lingers is a security problem, and every mutation below invalidates
- * explicitly — the TTL is only the backstop for changes made by another instance.
+ * mapping is cached in-process. Deliberately in-process rather than in Redis: a
+ * network round trip on every request to save one indexed query is a bad trade.
+ *
+ * The TTL is short because a revoked permission that lingers is a security
+ * problem. Phase 6 made the propagation immediate instead of merely bounded —
+ * a mutation publishes an invalidation signal and every instance drops the
+ * entry — leaving the TTL as the backstop for a signal that never arrived.
  */
 const CACHE_TTL_MS = 60_000;
 const permissionCache = new Map<string, { codes: readonly string[]; expiresAt: number }>();
 
+/**
+ * Clears this process's copy and tells the others. Called by every mutation
+ * below, and by the test helper after a truncate.
+ */
 export function invalidatePermissionCache(roleId?: string): void {
+  onPermissionInvalidation(roleId);
+  void publishSignal(SIGNAL.permissions, roleId);
+}
+
+/**
+ * The local half, and what the signal subscriber calls. Kept separate so a
+ * received signal clears the cache without publishing it back out.
+ */
+export function onPermissionInvalidation(roleId?: string): void {
   if (roleId) {
     permissionCache.delete(roleId);
     return;

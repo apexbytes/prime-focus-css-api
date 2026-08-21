@@ -22,9 +22,9 @@ endpoints, and build order. It is deliberately narrower than
 | Email              | Resend (outbound + inbound webhook)                                           | Requirement; inbound webhook is the email→ticket channel                                                                                    |
 | Logging            | Winston + `AsyncLocalStorage` correlation IDs                                 | Requirement; JSON to stdout, daily-rotate file in prod                                                                                      |
 | Async work         | `pg-boss` (Postgres-backed queue + cron)                                      | Retries, scheduling, dead-letter — no extra broker to run (see §11)                                                                         |
-| Realtime           | `socket.io` (Phase 3)                                                         | Ticket locks, typing indicators, live queue counts                                                                                          |
+| Realtime           | `socket.io` + Redis adapter (Phase 6)                                         | Ticket locks, typing indicators, live queue counts                                                                                          |
 | File storage       | S3-compatible object store, presigned uploads                                 | Attachments never transit the API process                                                                                                   |
-| Cache / rate limit | Redis (Phase 2)                                                               | Token buckets, KB search cache, socket adapter                                                                                              |
+| Cache / rate limit | Redis (Phase 6)                                                               | Token buckets, KB search cache, socket adapter                                                                                              |
 | Tests              | Vitest + Supertest + Testcontainers Postgres                                  | Real DB in integration tests, no mock drift                                                                                                 |
 
 ---
@@ -75,7 +75,11 @@ prime-focus-css/
 │   │   ├── logger/                   # winston setup + child loggers
 │   │   ├── resend/                   # client wrapper, retry, template renderer
 │   │   ├── queue/                    # pg-boss bootstrap, job registry, schedules
-│   │   └── storage/                  # object storage presign/get/delete
+│   │   ├── storage/                  # object storage presign/get/delete
+│   │   ├── antivirus/                # clamd over TCP, or a `none` driver
+│   │   ├── redis/                    # connection, duplicates for pub/sub, health
+│   │   ├── cache/                    # TTL store + cross-instance invalidation signals
+│   │   └── socket/                   # socket.io server, redis adapter, broadcast
 │   │
 │   ├── modules/                      # one folder per entity — see §3
 │   │   ├── auth/
@@ -102,19 +106,22 @@ prime-focus-css/
 │   │   ├── report/
 │   │   ├── retention/
 │   │   ├── api-key/
+│   │   ├── event/                    # domain event fan-out: realtime + webhooks
+│   │   ├── realtime/                 # ticket locks, typing, live queue counts
 │   │   ├── webhook/
 │   │   └── health/
 │   │
 │   ├── routes/
 │   │   └── v1.ts                     # mounts every module router under /api/v1
 │   └── workers/
-│       └── index.ts                  # registers job handlers exported by modules
+│       ├── index.ts                  # registers job handlers exported by modules
+│       └── subscribers.ts            # registers cache-invalidation signal handlers
 ├── tests/
 │   ├── helpers/                      # test db, auth fixtures, factories
 │   └── e2e/
 ├── .github/workflows/ci.yml          # format, lint, typecheck, tests, build
 ├── .env.example
-├── docker-compose.yml                # local PostgreSQL (host port 5434)
+├── docker-compose.yml                # local PostgreSQL (5434) + Redis (6381)
 ├── drizzle.config.ts
 ├── eslint.config.js                  # incl. enforced architectural boundaries
 ├── vitest.config.ts
@@ -140,6 +147,7 @@ ticket/
 ├── ticket.types.ts         # domain types, enums, DTOs
 ├── ticket.events.ts        # event names + payload types this module emits
 ├── ticket.jobs.ts          # queue handlers owned by this module (optional)
+├── ticket.gateway.ts       # websocket protocol, wiring only (optional)
 ├── ticket.policy.ts        # can-this-actor-do-this checks (optional)
 ├── ticket.mapper.ts        # row → API DTO (optional)
 ├── ticket.service.test.ts
@@ -220,7 +228,9 @@ Grouped by domain; each is a folder in `src/modules/`.
 
 - **email** — Resend outbound send with templates; inbound webhook (signature-verified) that parses replies, matches the ticket by reference/`Message-ID`, and appends a message or opens a new ticket; delivery/bounce/complaint event log.
 - **notification** — in-app notification records + fan-out to email; per-user preferences; digest job.
-- **webhook** — outbound subscriptions so other Prime Focus systems can react to ticket events; HMAC-signed, retried with backoff, delivery log.
+- **webhook** — outbound subscriptions so other Prime Focus systems can react to ticket events; HMAC-signed over `timestamp.body`, retried with backoff, delivery log, and a subscription that fails often enough switches itself off. The signing secret is returned once at creation and stored in the clear, because signing is not verifying — see §8.
+- **event** — the one place a domain event is announced. Owns no table and has no router: it turns a ticket change into the envelope both the websocket fan-out and the webhook fan-out consume, so a service that changes a ticket tells them in one call rather than two. In `modules/` rather than `common/` because it reaches two other modules' services.
+- **realtime** — the websocket side of the console: `ticket_locks` (advisory, expiring), typing indicators, live per-product queue counts, and a push of each in-app notification. Every one of them is also reachable over REST, so a browser behind a proxy that strips upgrades is slower rather than broken.
 - **audit** — append-only trail of every state change (actor, action, entity, before/after, IP, UA). Written inside the same transaction as the change. Read-only API for admins.
 - **report** — FRT, resolution time, SLA compliance, volume by product/channel/category, agent throughput, CSAT, knowledge base usage. Served from six materialised views refreshed every fifteen minutes, not from live ticket scans; the one exception is the open backlog, which is a level rather than a flow and is counted live off an index. Every response carries how stale it is.
 - **retention** — the scheduled enforcement of the Cyber and Data Protection Act periods. Its own module rather than part of `audit`, because the sweep spans audit rows, message bodies, attachments and customer records: it owns none of that data and orchestrates through those modules' services. `POST /retention/sweep` dry-runs by default.
@@ -275,6 +285,15 @@ calendar's zone.
 `csat_surveys`, `report_refreshes`, plus `anonymised_at` on `tickets` and
 `email_digest` on `notification_preferences`.
 
+**Realtime & scale** — built in Phase 6
+`ticket_locks`, `webhook_subscriptions`, `webhook_deliveries`.
+
+`ticket_locks` is keyed on `ticket_id` rather than carrying its own id: the
+primary key _is_ the mutual exclusion, so two instances racing for the same
+ticket are resolved by one insert-on-conflict rather than by whichever service
+checked first. `webhook_deliveries` is unique on `(subscription_id, event_id)`,
+which is what makes a fan-out that runs twice a no-op instead of a duplicate.
+
 `csat_surveys`, not `csat_responses`: the row is written when the survey is
 **sent**, and most rows never get a score. Response rate is itself a metric, and
 a table called `responses` full of unanswered rows would mislead everyone who
@@ -309,6 +328,8 @@ migration — see §8.
 - a unique index over the whole grouping key of every `report_*` view, all
   columns `not null`, because `refresh materialized view concurrently` requires
   one
+- `webhook_subscriptions (is_active, product_id)` — the fan-out's only query
+- `ticket_locks (socket_id)` — releasing everything a dropped connection held
 
 **Key state machine** — enforced in `ticket.service.ts`, not the DB:
 transitions are whitelisted, each one writes an `audit_log` row and emits a
@@ -427,12 +448,24 @@ GET    /retention/policy          (the cutoffs and what is past them)
 POST   /retention/sweep           { dryRun }  — dryRun defaults to **true**
 POST   /attachments/:id/rescan    (requeue a scan the scanner never answered)
 
+GET    /tickets/:id/lock          (who is working this ticket, if anyone)
+POST   /tickets/:id/lock          (take or refresh it — 200 with the holder
+                                   either way; a lock is advisory, so being
+                                   refused one is an answer, not an error)
+DELETE /tickets/:id/lock          (release your own; never anybody else's)
+GET    /realtime/queue-counts?productId=   (live, not from the reporting views)
+
+GET    /webhook-subscriptions     POST /webhook-subscriptions
+GET    /webhook-subscriptions/event-types  (the catalogue, for the console)
+GET|PATCH|DELETE /webhook-subscriptions/:id
+GET    /webhook-subscriptions/:id/deliveries
+POST   /webhook-deliveries/:id/redeliver   (re-sends the stored payload verbatim)
+
 POST   /webhooks/resend/inbound   (Svix-signed, unauthenticated, mounted ahead of
                                    the rate limiter so a spike of customer email
                                    is never throttled)
 POST   /webhooks/resend/events
 GET    /email/inbound/unprocessed POST /email/inbound/:id/reprocess
-GET    /webhook-subscriptions  POST /webhook-subscriptions
 GET    /audit-logs?entity=&actor=&from=&to=
 GET    /api-keys  POST /api-keys  DELETE /api-keys/:id
 GET    /healthz | /readyz          (mounted at the root, NOT under /api/v1 —
@@ -457,6 +490,34 @@ URLs land in browser history, `Referer` headers and proxy logs.
 
 Cursor pagination on every list (`?cursor=&limit=`, max 100). Errors carry a
 stable machine `code` from a single enum, never a raw driver message.
+
+### Websocket protocol
+
+Socket.IO, mounted at `REALTIME_PATH` (default `/realtime`). The access token
+goes in the handshake `auth` object, never in the query string — the same rule
+the REST API follows about tokens in URLs. **Staff sessions only**: an API key
+is refused, because a product system has no console and these rooms carry
+internal ticket state.
+
+```
+client → ticket:subscribe    { ticketId }   → ack: the current lock state
+client → ticket:unsubscribe  { ticketId }
+client → product:subscribe   { productId }  → server replies with queue:counts
+client → ticket:lock         { ticketId }   → ack: LockState
+client → ticket:unlock       { ticketId }
+client → ticket:typing       { ticketId, isTyping }
+
+server → ticket        the domain event envelope, to the ticket and product rooms
+server → ticket:lock   { ticketId, holder | null }
+server → ticket:typing { ticketId, userId, fullName, isTyping }
+server → queue:counts  { productId, unassigned, open, pending, onHold, breached }
+server → notification  an in-app notification, to the addressee's own room
+```
+
+Every client event answers through a callback (`{ ok: true, data }` or
+`{ ok: false, error }`), so a UI can show a failure rather than waiting forever.
+Each subscription is access-checked by the module that owns the resource, so a
+room is never a way around product scoping.
 
 ---
 
@@ -520,7 +581,7 @@ stable machine `code` from a single enum, never a raw driver message.
 | `report.refresh`        | cron, every 15 min           | report       | Phase 5 |
 | `notification.digest`   | cron, daily 07:00 CAT        | notification | Phase 5 |
 | `retention.sweep`       | cron, weekly                 | retention    | Phase 5 |
-| `webhook.deliver`       | domain event                 | webhook      | phase 6 |
+| `webhook.deliver`       | domain event                 | webhook      | Phase 6 |
 
 `email.send` and `email.inbound.process` are marked _inline_: they exist and work,
 but they still run in the request that causes them rather than as queued jobs.
@@ -827,9 +888,131 @@ Decisions worth knowing:
   fabricated advice about a financial product that `suggest` then shows to real
   customers. An empty knowledge base is a valid state; invented content is not.
 
-**Phase 6 — realtime & scale**
-socket.io (locks, typing, live counts), Redis cache + rate limits, outbound
-webhook subscriptions.
+**Phase 6 — realtime & scale** — _complete_
+`lib/redis`, `lib/cache`, `lib/socket`, and the `realtime`, `event` and
+`webhook` modules. 3 more tables, 2 more permissions, 10 more endpoints, one
+websocket protocol, and the first dependency this system shares between
+instances.
+
+Verified end to end: a ticket is raised and a partner system receives it over a
+signature it can check and a replay it can refuse; an agent opens the ticket and
+a colleague watching the same thread is told who has it, then told the moment
+that agent's browser closes; a queue header counts itself down without a poll;
+an article unpublished for being wrong stops being suggested inside a minute on
+every instance rather than only the one that unpublished it; and a receiver
+answering 500 leaves a delivery an operator can read the response body of and
+send again.
+
+Decisions worth knowing:
+
+- **Redis is where state is _shared_, never where it is _kept_.** Every path
+  through this system is correct with the `memory` driver and one instance —
+  the cache falls back to a bounded in-process map, the rate limiter counts
+  locally, the socket server serves its own clients. What Redis adds is
+  agreement between instances, which is why production refuses to boot without
+  a URL unless `CACHE_DRIVER=memory` is set deliberately, and why an
+  unreachable Redis fails `/readyz` but fails no request.
+- **The permission cache stayed in-process.** It is read on every
+  authenticated request, and a network round trip per request to save one
+  indexed query is a bad trade. What Phase 6 added is a pub/sub invalidation
+  signal, so a revoked permission propagates immediately instead of within the
+  60-second TTL. The TTL stays as the backstop for a signal that never arrived.
+  A received signal clears the local cache and does **not** re-publish, which is
+  the whole of what keeps it from bouncing between instances forever.
+- **A ticket lock is advisory and expires on its own.** A real lock's failure
+  mode is a closed laptop making a customer's ticket unworkable until an
+  administrator notices, which is worse than two agents occasionally
+  overlapping. So it blocks no write anywhere, `POST /tickets/:id/lock` answers
+  200 with the holder whether or not you got it — being refused a lock is an
+  answer, not an error — and `DELETE` releases only your own. There is no
+  force-release endpoint: a stuck lock clears itself in two minutes, and an
+  endpoint that could strip a colleague's lock buys nothing for that.
+- **The locks are in Postgres, despite being ephemeral.** An agent who opens a
+  ticket over plain HTTP has to see the same banner as one on a websocket, and
+  a Redis flush must not silently blank it. A socket that dies releases its
+  locks immediately through `socket_id`; the expiry is only the fallback for a
+  connection that never said goodbye.
+- **Sockets are staff-only, and re-checked on a timer.** An API key is refused
+  at the handshake: a product system has no console, and these rooms carry
+  internal ticket state. Because a connection is authenticated once and then
+  lives for hours, the _account_ is re-read every `REALTIME_REAUTH_SECONDS` and
+  a suspended one is disconnected. The access token is deliberately not
+  re-verified — it expires every fifteen minutes, and disconnecting the whole
+  desk each quarter hour would be a denial of service wearing a security badge.
+- **Every realtime feature has a REST twin.** Locks, queue counts and the
+  ticket itself are all reachable over HTTP, so a browser behind a proxy that
+  strips upgrades gets a slower console rather than a broken one. That is also
+  why `realtime` never fails readiness: an instance with no websocket layer is
+  still serving.
+- **Queue counts are counted live and throttled.** They come off `tickets`
+  rather than the reporting views, which are fifteen minutes stale by design —
+  a number that updates on a websocket has to be current or it is worse than no
+  number. The throttle is leading _and_ trailing at three seconds per product:
+  dropping the trailing send would leave the last change of a burst, usually the
+  one that emptied the queue, permanently unshown.
+- **One fan-out, not two.** `modules/event` exists so a service that changes a
+  ticket announces it once; the websocket broadcast and the webhook fan-out are
+  both downstream of that call. Two call sites at every state change would
+  drift, and the day a third consumer arrives no service should have to learn
+  about it. It lives in `modules/` rather than `common/` because it reaches two
+  other modules' services, which the layering does not allow `common/` to do.
+- **The most specific event name wins.** A resolution emits `ticket.resolved`
+  and _not_ `ticket.status_changed`. Emitting both would deliver every
+  resolution twice to a receiver subscribed to the general name, and a receiver
+  that wants every move subscribes to the three names the catalogue lists.
+- **A webhook payload never carries a message body.** `ticket.message_created`
+  carries the message id, its visibility and who wrote it. An internal note is
+  agent-only, and a webhook is an egress its author never saw — a receiver that
+  needs the text asks the API for it with credentials of its own. There is a
+  test that posts an internal note and asserts its words are not in the
+  delivered bytes.
+- **The signing secret is stored in the clear, and that is not an exception to
+  the rule.** Everything else presented as a bearer value is stored as a digest
+  because we _verify_ it. This one we _sign with_, and a digest cannot produce a
+  signature. It is generated rather than supplied — a secret the caller chose is
+  a secret that has been in a chat message — returned exactly once at creation,
+  kept out of the audit row, and rotated by creating a subscription and deleting
+  the old one, so the receiver holds both keys during the changeover.
+- **The signature covers `timestamp.body`, not the body.** Signing the body
+  alone leaves every captured request replayable forever. The separator is
+  load-bearing too: without it, timestamp `1` with body `23…` signs the same
+  bytes as timestamp `12` with body `3…`, and there is a test for exactly that.
+- **A subscription that fails often enough switches itself off.** Twenty
+  consecutive dead deliveries sets `disabled_at`, in the same statement that
+  increments the counter so two concurrent failures cannot both read "one short
+  of the limit". Re-enabling clears the counter, otherwise a subscription would
+  trip again on its first failure instead of getting a fresh run of attempts.
+- **There is no "send a test event" button.** It would have to fabricate a
+  ticket, and a delivery log full of tickets that never existed teaches a
+  receiver to accept them. The delivery log and `POST
+/webhook-deliveries/:id/redeliver` cover the same need with real events —
+  and a redelivery re-sends the _stored_ payload verbatim rather than rebuilding
+  it, because the receiver asked to be told what happened at the time.
+- **Webhook URLs are restricted, and the limit is stated rather than implied.**
+  https only in production, and no literal loopback, link-local or private
+  address — this process can reach the metadata endpoint and the database, and
+  an administrator configuring a subscription cannot. It checks the literal
+  host, so a public name resolving to a private address still passes; closing
+  that needs resolution at connect time and a pinned socket, which is worth
+  doing the day these endpoints are chosen by anyone but our own administrators.
+- **The delivery log is swept, and it is not a retention policy.** A delivery
+  row is operational debris, not personal data the Act has an opinion about, so
+  it has its own period in days and is dropped by the retention sweep because
+  that is the job already running weekly with permission to delete things. The
+  same pass clears abandoned ticket locks.
+- **`webhook.deliver` throws to ask for a retry, and stops throwing when the
+  budget is spent.** That is how pg-boss is told to back off. A delivery on its
+  last attempt is recorded `failed` and returns normally — throwing there would
+  retry past the limit the operator configured. The first version of this made
+  the failure recording _inside_ the `try`, where the retry throw landed in its
+  own `catch` and overwrote the receiver's status code with "delivery failed";
+  the integration test that reads back a 500 is what found it.
+- **The API key quota is keyed on the key's prefix.** The prefix is the
+  non-secret handle the key format exists to provide, so a shared Redis never
+  holds anything replayable, and one integration's retry storm cannot spend the
+  per-IP budget every browser behind the same NAT is sharing. A Redis outage
+  makes every limiter pass rather than fail: taking the API down to protect it
+  is the wrong direction.
 
 **Phase 7 — federation**
 OAuth2/OIDC SSO (Google/Microsoft) and, if an enterprise partner requires it,
@@ -858,8 +1041,14 @@ ANTIVIRUS_DRIVER, ANTIVIRUS_HOST, ANTIVIRUS_PORT, ANTIVIRUS_TIMEOUT_MS, ANTIVIRU
 NOTIFICATION_DIGEST_CRON, NOTIFICATION_DIGEST_ENABLED
 RETENTION_SWEEP_CRON, RETENTION_SWEEP_ENABLED, RETENTION_AUDIT_LOG_YEARS,
 RETENTION_TICKET_YEARS, RETENTION_SWEEP_BATCH_SIZE
-REDIS_URL                      # phase 6
+REDIS_URL, CACHE_DRIVER, REDIS_KEY_PREFIX, REDIS_CONNECT_TIMEOUT_MS,
+KB_SUGGEST_CACHE_TTL_SECONDS
+REALTIME_ENABLED, REALTIME_PATH, REALTIME_REAUTH_SECONDS,
+TICKET_LOCK_TTL_SECONDS, TICKET_LOCK_HEARTBEAT_SECONDS
+WEBHOOK_TIMEOUT_MS, WEBHOOK_MAX_ATTEMPTS, WEBHOOK_DISABLE_AFTER_FAILURES,
+WEBHOOK_DELIVERY_RETENTION_DAYS
 RATE_LIMIT_WINDOW, RATE_LIMIT_MAX
+API_KEY_RATE_LIMIT_WINDOW_MS, API_KEY_RATE_LIMIT_MAX
 DEFAULT_TIMEZONE=Africa/Harare
 ```
 
@@ -887,6 +1076,13 @@ or malformed — never `process.env.X` anywhere else in the codebase.
   adapter boundary.
 - **Contract** — Resend inbound webhook fixtures (plain reply, HTML reply,
   forwarded chain, autoresponder, attachment) as golden files.
+- **Realtime** — the websocket suite starts a real HTTP server, connects real
+  Socket.IO clients and asserts what one agent sees when another takes a lock,
+  including the release on disconnect. A gateway tested through a stub would
+  not have caught that Socket.IO's own `close()` also closes the HTTP server.
+- **Webhooks** — an actual listener on a loopback port receives the delivery,
+  and the test verifies the signature with the receiver's half of the scheme
+  rather than re-running the signer.
 - **Authorisation matrix** — a table-driven test asserting each role × endpoint
   outcome. This is the one suite that must never be skipped: RBAC regressions
   in a fintech leak customer financial data.
@@ -934,7 +1130,15 @@ Called out so the trade-offs are explicit, not silently dropped:
    a failed transfer in words no article uses gets nothing back.
 6. **SSO moved last.** Local auth plus the emailed second factor secures staff
    now; SSO is an added strategy in Phase 7, not a prerequisite.
-7. **Full microservices → modular monolith.** Every module already owns its
+7. **Ticket locks are advisory, not exclusive.** The draft asked for
+   "concurrency and collision control", and what is built shows who is in a
+   thread rather than keeping anyone out of it. A lock that can outlive the
+   browser holding it makes a customer's ticket unworkable, and the collision
+   this actually prevents — two agents typing the same answer — is prevented by
+   both of them being able to see the other. Nothing in the write path consults
+   a lock.
+
+8. **Full microservices → modular monolith.** Every module already owns its
    routes/service/repository/schema with enforced boundaries, so any of them
    can be extracted later. Starting distributed would buy distributed-tracing
    pain before there is load to justify it.

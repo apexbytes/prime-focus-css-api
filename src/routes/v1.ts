@@ -15,6 +15,7 @@ import { macroRouter } from '../modules/macro/index.js';
 import { trustedDeviceRouter } from '../modules/mfa/index.js';
 import { notificationRouter } from '../modules/notification/index.js';
 import { productRouter } from '../modules/product/index.js';
+import { realtimeRouter } from '../modules/realtime/index.js';
 import { reportRouter } from '../modules/report/index.js';
 import { retentionRouter } from '../modules/retention/index.js';
 import { routingRuleRouter } from '../modules/routing/index.js';
@@ -25,6 +26,7 @@ import { tagRouter } from '../modules/tag/index.js';
 import { teamRouter } from '../modules/team/index.js';
 import { ticketRouter } from '../modules/ticket/index.js';
 import { userRouter } from '../modules/user/index.js';
+import { webhookDeliveryRouter, webhookRouter } from '../modules/webhook/index.js';
 
 const MODULES = [
   'auth',
@@ -52,6 +54,8 @@ const MODULES = [
   'csat',
   'reports',
   'retention',
+  'realtime',
+  'webhook-subscriptions',
 ] as const;
 
 /**
@@ -113,3 +117,11 @@ v1Router.use('/surveys', surveyPublicRouter);
 v1Router.use('/csat', csatRouter);
 v1Router.use('/reports', reportRouter);
 v1Router.use('/retention', retentionRouter);
+
+// -- realtime & outbound webhooks ---------------------------------------------
+v1Router.use('/realtime', realtimeRouter);
+v1Router.use('/webhook-subscriptions', webhookRouter);
+// Its own path rather than nested under a subscription: a delivery id is not
+// scoped by the subscription in the URL, so nesting would invite a request that
+// names one subscription and redelivers another's event.
+v1Router.use('/webhook-deliveries', webhookDeliveryRouter);

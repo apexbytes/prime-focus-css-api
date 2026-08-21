@@ -9,14 +9,14 @@ The API design — modules, data model, endpoints, and build order — lives in
 ## Requirements
 
 - Node.js 24 LTS or newer
-- Docker (for the local PostgreSQL instance)
+- Docker (for the local PostgreSQL and Redis instances)
 
 ## Getting started
 
 ```bash
 npm install
 cp .env.example .env      # defaults match the Docker Compose database
-npm run db:up             # start PostgreSQL on localhost:5434
+npm run db:up             # start PostgreSQL on 5434 and Redis on 6381
 npm run db:migrate        # create extensions and apply migrations
 npm run db:seed           # roles, permissions, and the one default administrator
 npm run dev               # http://localhost:3000
@@ -35,19 +35,19 @@ curl localhost:3000/api/v1    # API index
 
 ## Scripts
 
-| Script                      | Purpose                                            |
-| --------------------------- | -------------------------------------------------- |
-| `npm run dev`               | Watch-mode server via `tsx`                        |
-| `npm run build` / `start`   | Compile to `dist/`, then run it                    |
-| `npm run check`             | Everything CI runs: format, lint, typecheck, tests |
-| `npm run lint` / `lint:fix` | ESLint, including architectural boundary rules     |
-| `npm run typecheck`         | `tsc --noEmit` over `src` and `tests`              |
-| `npm test` / `test:watch`   | Vitest                                             |
-| `npm run db:up` / `db:down` | Start/stop the local PostgreSQL container          |
-| `npm run db:generate`       | Generate a migration from schema changes           |
-| `npm run db:migrate`        | Apply pending migrations                           |
-| `npm run db:reset`          | Destroy the local database and rebuild it          |
-| `npm run db:studio`         | Drizzle Studio                                     |
+| Script                      | Purpose                                              |
+| --------------------------- | ---------------------------------------------------- |
+| `npm run dev`               | Watch-mode server via `tsx`                          |
+| `npm run build` / `start`   | Compile to `dist/`, then run it                      |
+| `npm run check`             | Everything CI runs: format, lint, typecheck, tests   |
+| `npm run lint` / `lint:fix` | ESLint, including architectural boundary rules       |
+| `npm run typecheck`         | `tsc --noEmit` over `src` and `tests`                |
+| `npm test` / `test:watch`   | Vitest                                               |
+| `npm run db:up` / `db:down` | Start/stop the local PostgreSQL and Redis containers |
+| `npm run db:generate`       | Generate a migration from schema changes             |
+| `npm run db:migrate`        | Apply pending migrations                             |
+| `npm run db:reset`          | Destroy the local database and rebuild it            |
+| `npm run db:studio`         | Drizzle Studio                                       |
 
 ## Testing
 
@@ -365,22 +365,138 @@ deletion. The weekly cron runs for real. `RETENTION_AUDIT_LOG_YEARS` below
 `RETENTION_TICKET_YEARS` is refused rather than clamped — it would delete the
 record of an anonymisation before performing it.
 
+## Realtime and outbound webhooks
+
+### Ticket locks and live counts
+
+Everything the websocket offers is also an HTTP endpoint, so a console behind a
+proxy that strips upgrades is slower rather than broken.
+
+```bash
+# take the lock on a ticket, or refresh one you already hold
+curl -X POST localhost:3000/api/v1/tickets/$TICKET/lock -H "authorization: Bearer $TOKEN"
+# → { acquired: true, holder: { userId, fullName, acquiredAt, expiresAt }, heartbeatSeconds }
+
+# somebody else has it: still a 200, because a lock is advisory
+# → { acquired: false, holder: { fullName: "Chipo Agent", … } }
+
+# release your own — never anybody else's, and there is no force-release
+curl -X DELETE localhost:3000/api/v1/tickets/$TICKET/lock -H "authorization: Bearer $TOKEN"
+
+# the queue header, counted live rather than from the 15-minute reporting views
+curl "localhost:3000/api/v1/realtime/queue-counts?productId=$PRODUCT" -H "authorization: Bearer $TOKEN"
+```
+
+A lock expires after `TICKET_LOCK_TTL_SECONDS` and is released the moment the
+holder's socket drops. It blocks no write anywhere in the system: what it buys
+is the console being able to say "Chipo is replying to this" before a second
+agent types the same answer.
+
+### The websocket
+
+Socket.IO at `REALTIME_PATH` (default `/realtime`). The access token goes in the
+handshake `auth` object, never the query string. **Staff sessions only** — an
+API key is refused, because a product system has no console.
+
+```js
+const socket = io('http://localhost:3000', {
+  path: '/realtime',
+  auth: { token: accessToken },
+});
+
+socket.emit('ticket:subscribe', { ticketId }, (res) => console.log(res.data)); // lock state
+socket.emit('product:subscribe', { productId });
+socket.emit('ticket:lock', { ticketId }, (res) => console.log(res.data.acquired));
+socket.emit('ticket:typing', { ticketId, isTyping: true });
+
+socket.on('ticket', (event) => {}); // a domain event about a ticket you watch
+socket.on('ticket:lock', (state) => {}); // somebody took or released the lock
+socket.on('ticket:typing', (who) => {});
+socket.on('queue:counts', (counts) => {}); // live totals for a product
+socket.on('notification', (item) => {}); // addressed to you, no subscription needed
+```
+
+Every client event answers through a callback — `{ ok: true, data }` or
+`{ ok: false, error }`. Subscriptions are access-checked by the module that owns
+the resource, so a room is never a way around product scoping. An open socket
+re-checks every `REALTIME_REAUTH_SECONDS` that its account is still active and
+disconnects if it is not.
+
+### Outbound webhooks
+
+```bash
+# subscribe another Prime Focus system to ticket events (perm webhook:manage)
+curl -X POST localhost:3000/api/v1/webhook-subscriptions \
+  -H "authorization: Bearer $TOKEN" -H 'content-type: application/json' \
+  -d '{"name":"Wallet ledger","url":"https://ledger.internal/hooks/support",
+       "eventTypes":["ticket.created","ticket.resolved"],"productId":"…"}'
+# → the signing secret, once. It is never returned again.
+
+curl localhost:3000/api/v1/webhook-subscriptions/event-types -H "authorization: Bearer $TOKEN"
+curl localhost:3000/api/v1/webhook-subscriptions/$ID/deliveries -H "authorization: Bearer $TOKEN"
+curl -X POST localhost:3000/api/v1/webhook-deliveries/$ID/redeliver -H "authorization: Bearer $TOKEN"
+```
+
+Each delivery arrives as:
+
+```
+POST /your/endpoint
+x-pf-event: ticket.created
+x-pf-event-id: 018f…            ← deduplicate on this
+x-pf-delivery: 018f…
+x-pf-timestamp: 1770000000
+x-pf-signature: v1=<hex>
+```
+
+Verify it by computing `HMAC-SHA256(secret, "<timestamp>.<raw body>")` and
+comparing in constant time, then **reject a timestamp older than five minutes** —
+the timestamp is inside the signed string precisely so a captured request is not
+replayable forever.
+
+A payload never contains a message body. `ticket.message_created` carries the
+message id, its visibility and who wrote it; an internal note is agent-only, and
+a webhook is an egress its author never saw. A receiver that needs the text asks
+the API for it with credentials of its own.
+
+Failed deliveries retry with backoff up to `WEBHOOK_MAX_ATTEMPTS` and are
+readable in the delivery log with the response status and body. A subscription
+that fails `WEBHOOK_DISABLE_AFTER_FAILURES` times in a row switches itself off;
+`PATCH { "isActive": true }` puts it back with a clean counter.
+
+There is deliberately no "send a test event" button: it would have to fabricate a
+ticket, and a delivery log full of tickets that never existed teaches a receiver
+to accept them.
+
+### Redis
+
+Redis holds the state that has to be _shared between instances_ — rate-limit
+counters, the knowledge base's suggestion cache, cache-invalidation signals and
+the Socket.IO room registry. Nothing depends on it to be correct: with
+`CACHE_DRIVER=memory` every path still works, for one instance. Production
+refuses to boot without `REDIS_URL` unless that driver is chosen deliberately,
+because two instances with local counters give a caller twice the budget they
+were sold and never see each other's broadcasts.
+
+`/readyz` reports it. A configured-but-unreachable Redis fails readiness and
+fails no request: the limiters pass and the caches miss.
+
 ### Async jobs
 
 Jobs run on **pg-boss**, in the same process that serves HTTP, against its own
 `pgboss` schema. `/readyz` reports the queue alongside Postgres.
 
-| Job                   | Trigger                  | Does                                            |
-| --------------------- | ------------------------ | ----------------------------------------------- |
-| `ticket.triage`       | ticket created           | matches routing rules, sets the team            |
-| `ticket.autoassign`   | after triage             | picks an agent, or leaves it queued             |
-| `sla.scan`            | cron, every minute       | records breaches, hands off to the ladder       |
-| `sla.escalate`        | from the scan            | fires escalation rungs                          |
-| `survey.dispatch`     | ticket resolved, delayed | emails the CSAT survey, or skips it             |
-| `attachment.scan`     | bytes uploaded           | settles an attachment to clean/infected/skipped |
-| `report.refresh`      | cron, every 15 min       | rebuilds the six reporting views                |
-| `notification.digest` | cron, 07:00 CAT          | one email an agent about what is waiting        |
-| `retention.sweep`     | cron, Sundays 03:00      | enforces the retention policy, one batch        |
+| Job                   | Trigger                  | Does                                                |
+| --------------------- | ------------------------ | --------------------------------------------------- |
+| `ticket.triage`       | ticket created           | matches routing rules, sets the team                |
+| `ticket.autoassign`   | after triage             | picks an agent, or leaves it queued                 |
+| `sla.scan`            | cron, every minute       | records breaches, hands off to the ladder           |
+| `sla.escalate`        | from the scan            | fires escalation rungs                              |
+| `survey.dispatch`     | ticket resolved, delayed | emails the CSAT survey, or skips it                 |
+| `attachment.scan`     | bytes uploaded           | settles an attachment to clean/infected/skipped     |
+| `report.refresh`      | cron, every 15 min       | rebuilds the six reporting views                    |
+| `notification.digest` | cron, 07:00 CAT          | one email an agent about what is waiting            |
+| `retention.sweep`     | cron, Sundays 03:00      | enforces the retention policy, one batch            |
+| `webhook.deliver`     | a domain event           | signs and POSTs one delivery, retrying with backoff |
 
 `QUEUE_DRIVER=inline` runs a job the moment it is enqueued and **fires no
 schedule**. Tests use it, so the job path is the path under test; setting it

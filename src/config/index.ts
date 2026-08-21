@@ -2,6 +2,7 @@ export {
   env,
   envSchema,
   parseEnv,
+  cacheDriver,
   corsOrigins,
   emailTransport,
   queueDriver,
