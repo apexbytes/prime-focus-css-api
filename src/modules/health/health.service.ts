@@ -1,5 +1,6 @@
 import { env, SERVICE_NAME } from '../../config/index.js';
 import { checkDatabaseConnection } from '../../db/client.js';
+import { checkQueue } from '../../lib/queue/index.js';
 import { isShuttingDown } from '../../common/utils/lifecycle.js';
 import type { DependencyStatus, LivenessReport, ReadinessReport } from './health.types.js';
 
@@ -29,17 +30,27 @@ async function checkDatabase(): Promise<DependencyStatus> {
   };
 }
 
+async function checkJobQueue(): Promise<DependencyStatus> {
+  const result = await checkQueue();
+  return {
+    name: 'queue',
+    state: result.state,
+    ...(result.error ? { error: result.error } : {}),
+  };
+}
+
 /**
  * Readiness answers "should this instance receive traffic". Dependencies added
- * in later phases register here: the queue in Phase 4, Resend in Phase 3.
+ * in later phases register here: Resend still reports `not_configured`.
+ *
+ * An unreachable queue *does* fail readiness. Under `QUEUE_DRIVER=inline` it
+ * reports `not_configured` instead, which is honest — jobs run, schedules do
+ * not — and does not fail the probe.
  */
 export async function getReadiness(): Promise<ReadinessReport> {
-  const dependencies: DependencyStatus[] = await Promise.all([checkDatabase()]);
+  const dependencies: DependencyStatus[] = await Promise.all([checkDatabase(), checkJobQueue()]);
 
-  dependencies.push(
-    { name: 'queue', state: 'not_configured' },
-    { name: 'resend', state: 'not_configured' },
-  );
+  dependencies.push({ name: 'resend', state: 'not_configured' });
 
   const draining = isShuttingDown();
   const hasFailure = dependencies.some((dependency) => dependency.state === 'unavailable');

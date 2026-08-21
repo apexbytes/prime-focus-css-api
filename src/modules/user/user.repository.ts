@@ -17,6 +17,8 @@ const withRoleColumns = {
   lastLoginAt: users.lastLoginAt,
   failedLoginAttempts: users.failedLoginAttempts,
   lockedUntil: users.lockedUntil,
+  availability: users.availability,
+  maxOpenTickets: users.maxOpenTickets,
   deletedAt: users.deletedAt,
   createdAt: users.createdAt,
   updatedAt: users.updatedAt,

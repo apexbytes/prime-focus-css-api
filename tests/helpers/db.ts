@@ -2,8 +2,10 @@ import { sql } from 'drizzle-orm';
 import { db } from '../../src/db/client.js';
 import { seedCatalogue } from '../../src/db/seeds/catalogue.js';
 import { seedPermissions, seedRoles } from '../../src/db/seeds/identity.js';
+import { seedServiceLevels } from '../../src/db/seeds/service-levels.js';
 import { clearOutbox } from '../../src/lib/resend/index.js';
 import { invalidatePermissionCache } from '../../src/modules/role/role.service.js';
+import { invalidateCalendarCache } from '../../src/modules/sla/sla.service.js';
 
 /**
  * Order matters only for readability — CASCADE handles the foreign keys. The
@@ -11,6 +13,15 @@ import { invalidatePermissionCache } from '../../src/modules/role/role.service.j
  */
 const TABLES = [
   'audit_logs',
+  'escalations',
+  'escalation_rules',
+  'routing_rules',
+  'agent_skills',
+  'sla_breaches',
+  'ticket_sla_targets',
+  'sla_policies',
+  'holidays',
+  'business_hours',
   'inbound_emails',
   'outbound_emails',
   'email_events',
@@ -51,6 +62,9 @@ export async function resetDatabase(): Promise<void> {
   await seedPermissions();
   await seedRoles();
   await seedCatalogue();
+  // Business hours, holidays and SLA policies: without them a ticket gets no
+  // targets, and every SLA assertion would pass by doing nothing.
+  await seedServiceLevels();
 
   // Ticket references come from a sequence, so tests would otherwise see numbers
   // climbing across files.
@@ -58,5 +72,7 @@ export async function resetDatabase(): Promise<void> {
 
   // The cache is keyed by role id, and truncation gives roles new ids.
   invalidatePermissionCache();
+  // Calendars are cached in-process and truncation gives them new ids.
+  invalidateCalendarCache();
   clearOutbox();
 }

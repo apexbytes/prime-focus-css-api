@@ -4,6 +4,7 @@ export {
   parseEnv,
   corsOrigins,
   emailTransport,
+  queueDriver,
   storageBackend,
   isDevelopment,
   isProduction,

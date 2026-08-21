@@ -240,7 +240,8 @@ timestamps stored UTC and rendered in `Africa/Harare`.
 No `mfa_secrets` or `mfa_recovery_codes`: an emailed code needs neither. No
 `email_verification_tokens` either — accepting an invitation _is_ the proof of address
 control, so a separate verification step would verify the same fact twice.
-`agent_skills` arrives with Phase 4 routing.
+`agent_skills` arrived with Phase 4 routing, alongside `availability` and
+`max_open_tickets` on `users`.
 
 **Context**
 `products`, `customers`, `customer_product_accounts`, `customer_merges`.
@@ -256,9 +257,16 @@ control, so a separate verification step would verify the same fact twice.
 Ticket references come from a **sequence**, not a count: two concurrent creates would
 otherwise race to the same number.
 
-**Service levels**
-`sla_policies`, `business_hours`, `holidays`, `ticket_sla_targets`,
-`sla_breaches`, `escalation_rules`, `escalations`.
+**Service levels & routing** — built in Phase 4
+`business_hours`, `holidays`, `sla_policies`, `ticket_sla_targets`,
+`sla_breaches`, `escalation_rules`, `escalations`, `routing_rules`,
+`agent_skills`, plus `availability` and `max_open_tickets` on `users`.
+
+`business_hours` holds one week as `jsonb` rather than a child table of windows —
+the clock loads a whole calendar to compute against and never queries a single
+window. `holidays` is calendar-scoped and keyed on a `date`, because a public
+holiday is a local calendar day and which UTC instants that covers depends on the
+calendar's zone.
 
 **Self-service**
 `kb_articles`, `kb_article_revisions`, `kb_article_feedback`, `kb_views`,
@@ -274,7 +282,9 @@ otherwise race to the same number.
 - `tickets (status, assigned_to)`, `tickets (product_id, status, created_at desc)`
 - `tickets (reference)` unique
 - `ticket_messages (ticket_id, created_at)`
-- `ticket_sla_targets (due_at) where breached_at is null` — the escalation cron's only scan
+- `ticket_sla_targets (due_at) where satisfied_at is null and breached_at is null and paused_at is null`
+  — the breach scan's only query. `sla.repository.dueTargets` filters on exactly
+  these three columns; if they drift the scan silently stops using the index
 - `kb_articles` GIN on `search_vector`
 - `audit_logs (entity_type, entity_id, created_at desc)`
 
@@ -359,8 +369,21 @@ GET    /macros  POST /macros  PATCH|DELETE /macros/:id
 POST   /macros/:id/apply/:ticketId   (changes fields, returns text — sends nothing)
 
 GET    /sla-policies  POST /sla-policies  PATCH /sla-policies/:id
-GET    /business-hours  PUT /business-hours/:id
-GET    /escalation-rules  POST /escalation-rules
+GET    /business-hours  GET|PUT /business-hours/:id
+POST   /business-hours/:id/holidays   DELETE /business-hours/:id/holidays/:holidayId
+GET    /escalation-rules  POST /escalation-rules  PATCH|DELETE /escalation-rules/:id
+GET    /routing-rules  POST /routing-rules  PATCH|DELETE /routing-rules/:id
+
+GET    /tickets/:id/sla          (both clocks, consumed fraction, breaches)
+GET    /tickets/:id/escalations  (the ladder as actually climbed)
+GET    /tickets/:id/routing      (which rule would place this ticket, changing nothing)
+
+PATCH  /users/me/availability    (an agent marks themselves online/away/offline)
+PATCH  /users/:id/availability   PATCH /users/:id/capacity
+GET|PUT /users/:id/skills
+
+POST   /sla/scan                 (run the breach scan and the ladder now)
+POST   /escalation-rules/run     (run only the ladder now)
 
 GET    /kb/articles?product=&q=   POST /kb/articles
 GET|PATCH /kb/articles/:id        POST /kb/articles/:id/publish
@@ -451,20 +474,33 @@ stable machine `code` from a single enum, never a raw driver message.
 
 ## 7. Async jobs (`pg-boss`)
 
-| Job                     | Trigger                      | Owner module |
-| ----------------------- | ---------------------------- | ------------ |
-| `email.send`            | queued on notification/reply | email        |
-| `email.inbound.process` | Resend inbound webhook       | email        |
-| `ticket.triage`         | ticket created               | routing      |
-| `ticket.autoassign`     | after triage                 | routing      |
-| `sla.scan`              | cron, every minute           | sla          |
-| `sla.escalate`          | from scan                    | escalation   |
-| `survey.dispatch`       | ticket resolved + delay      | survey       |
-| `attachment.scan`       | upload confirmed             | attachment   |
-| `webhook.deliver`       | domain event                 | webhook      |
-| `report.refresh`        | cron, every 15 min           | report       |
-| `notification.digest`   | cron, daily 07:00 CAT        | notification |
-| `retention.sweep`       | cron, weekly                 | audit        |
+| Job                     | Trigger                      | Owner module | Built   |
+| ----------------------- | ---------------------------- | ------------ | ------- |
+| `ticket.triage`         | ticket created               | routing      | Phase 4 |
+| `ticket.autoassign`     | after triage                 | routing      | Phase 4 |
+| `sla.scan`              | cron, every minute           | sla          | Phase 4 |
+| `sla.escalate`          | from scan                    | escalation   | Phase 4 |
+| `email.send`            | queued on notification/reply | email        | inline  |
+| `email.inbound.process` | Resend inbound webhook       | email        | inline  |
+| `survey.dispatch`       | ticket resolved + delay      | survey       | phase 5 |
+| `attachment.scan`       | upload confirmed             | attachment   | phase 5 |
+| `report.refresh`        | cron, every 15 min           | report       | phase 5 |
+| `webhook.deliver`       | domain event                 | webhook      | phase 6 |
+| `notification.digest`   | cron, daily 07:00 CAT        | notification | phase 5 |
+| `retention.sweep`       | cron, weekly                 | audit        | phase 5 |
+
+`email.send` and `email.inbound.process` are marked _inline_: they exist and work,
+but they still run in the request that causes them rather than as queued jobs.
+Phase 4 deliberately did not move them — the Phase 3 email path is verified
+behaviour and rewriting it buys retry-across-restart at the cost of re-proving
+threading and acknowledgement. Moving them is a contained change now that
+`lib/queue` exists.
+
+Handlers are registered by `src/workers/index.ts`, which `createApp()` calls.
+Registration is pure bookkeeping — a name-to-handler map — so it is safe during
+app assembly; `startQueue()` is called from `server.ts`, which is why a Supertest
+suite never opens a queue. The consequence is deliberate: under the `inline`
+driver the handlers are present, so a test that enqueues runs the real job.
 
 Webhook ingress does the minimum synchronously (verify signature, persist raw
 payload, 200) and queues the parse. A Resend outage must never turn into a
@@ -557,9 +593,81 @@ Decisions worth knowing:
   after commit and swallows its own errors: a mail outage must not cost a saved ticket.
   Switchable with `SEND_TICKET_ACKNOWLEDGEMENT`.
 
-**Phase 4 — routing & SLA**
-routing, sla, business hours, escalation, the pg-boss cron surface. Ends with:
-tickets auto-assign and breaches escalate without human input.
+**Phase 4 — routing & SLA** — _complete_
+routing, sla, escalation, `lib/queue` (pg-boss) and `workers/`. 10 more tables, 2
+columns on `users`, 21 more endpoints, and the first scheduled work in the system.
+
+Verified end to end: a ticket arrives, is given a first-response and a resolution
+deadline from its product's policy, lands on an available agent without anyone
+touching it, has its clock stopped while the customer is thinking and restarted
+where it left off, and — when the deadline passes — is marked breached exactly
+once and escalated up the ladder. The pg-boss path was exercised for real, not
+only under the inline driver: the cron fired every minute, `sla.scan` handed off
+to `sla.escalate`, and SIGTERM drained both before closing the pool.
+
+Decisions worth knowing:
+
+- **SLA targets are written in the ticket's own transaction**, not by the triage
+  job. Everything else about routing is asynchronous, but a ticket whose targets
+  went missing because the queue was down would look permanently on time and
+  never escalate. Two extra queries buys the guarantee that a saved ticket always
+  has a deadline.
+- **`due_at` is the single source of truth for a deadline.** Consumption is
+  measured _backwards_ from it rather than forwards from the start, and pausing
+  moves `due_at` rather than accumulating an offset to apply later. An earlier
+  version measured elapsed time from `started_at` and the two disagreed: a target
+  could be past `due_at`, and so breached, while the elapsed-time figure still
+  read under 100% — which made the last rung of every ladder unreachable. The
+  clock's `consumedFraction` and the breach scan now answer to the same column.
+- **The clock does its own timezone arithmetic through `Intl`**, with no date
+  library. Africa/Harare has no daylight saving, so a fixed UTC+2 offset would
+  have worked and would have been quietly wrong the first time a calendar was
+  created in another zone. `sla.clock.ts` is pure and has the heaviest unit
+  coverage in the codebase; the DST case is a real test, not a hypothetical.
+- **Business hours are one `jsonb` week, not a child table.** The clock loads a
+  whole calendar to do arithmetic on it and never queries individual windows, and
+  `PUT /business-hours/:id` replaces the week as one value. A child table would
+  have added a join to every target for nothing.
+- **Routing is first-match-wins in an explicit `sort_order`**, not
+  most-specific-wins. Ranking criteria against each other requires deciding
+  whether product beats priority, and two equally specific rules would then be
+  resolved by something invisible. An explicit order is auditable and an operator
+  can reorder it.
+- **Load is compared as a share of each agent's own capacity**, so a part-timer
+  with a limit of 5 is not handed work until they are as busy as a full-timer with
+  a limit of 20. Skill breaks the tie, then least-recently-assigned — which is
+  what makes the round-robin fallback genuine rather than always the same
+  alphabetically-first name.
+- **Nobody available is a normal outcome.** The ticket stays unassigned, where
+  every agent on the product can see it. Selection relaxes the team and then the
+  skill to find someone, but never availability or capacity: an offline or
+  over-capacity agent is a worse home for a customer's problem than an open queue.
+- **Auto-assignment only considers explicit `user_products` grants.**
+  Administrators hold `ticket:read_all_products` and can read every queue, but
+  assigning to them on the strength of that permission would drop customer tickets
+  on people who do not work one.
+- **Escalation fires every rung a ticket has passed**, not just the highest, so a
+  ladder that warns at 80% and reassigns at 100% does both and the warning is on
+  the record. The unique constraint on `(ticket, rule, target)` is the idempotency
+  guard, and the insert _is_ the lock — checking first and inserting after would
+  race between instances. The escalation is recorded before its side effects run,
+  so a failed reassignment does not make the ladder retry the same rung forever.
+- **Raising a priority does not move a live deadline.** `target_minutes` is copied
+  onto the target at creation, so neither an escalation nor an edited policy
+  rewrites an agent's afternoon.
+- **`sla.scan` and `POST /sla/scan` are the same code path** (`scanAndEscalate`).
+  They were briefly not, and the endpoint recorded breaches without escalating
+  them — exactly the difference an operator running it by hand would not expect.
+- **The queue has an `inline` driver**, following `EMAIL_TRANSPORT=log` and the
+  local storage backend. It runs a job the instant it is enqueued and fires no
+  schedule, which is what lets the test suite exercise the real job handlers with
+  no queue running. It reports `not_configured` on `/readyz` rather than `ok`,
+  because nothing is going to run a schedule under it.
+- **A default configuration is seeded**, so a fresh deployment escalates rather
+  than sitting inert: the Zimbabwe working week, the public holidays for this year
+  and next (Easter and the August holidays computed, not listed, so the seed does
+  not silently run out), a policy per product and priority, a `Support Desk` team,
+  a catch-all routing rule, and a two-rung ladder.
 
 **Phase 5 — deflection & insight**
 knowledge-base + search, survey/CSAT, report views.
@@ -585,6 +693,9 @@ ARGON2_MEMORY_COST
 MFA_ISSUER, ENCRYPTION_KEY
 RESEND_API_KEY, RESEND_FROM, RESEND_INBOUND_SECRET, SUPPORT_INBOX_DOMAIN
 STORAGE_ENDPOINT, STORAGE_BUCKET, STORAGE_KEY, STORAGE_SECRET
+QUEUE_DRIVER, QUEUE_SCHEMA, QUEUE_CONCURRENCY, QUEUE_JOB_EXPIRY_SECONDS, QUEUE_RETRY_LIMIT
+SLA_SCAN_CRON, SLA_SCAN_BATCH_SIZE
+AUTO_ASSIGN_ENABLED, ROUTING_ASSIGN_TO_AWAY_AGENTS, DEFAULT_AGENT_MAX_OPEN_TICKETS
 REDIS_URL                      # phase 6
 RATE_LIMIT_WINDOW, RATE_LIMIT_MAX
 DEFAULT_TIMEZONE=Africa/Harare
@@ -621,9 +732,11 @@ Called out so the trade-offs are explicit, not silently dropped:
    enqueue-with-commit for free, and swapping it later only touches
    `lib/queue/`.
 2. **AI/NLP triage → deterministic rules first.** Phase 4 routing uses
-   metadata rules. Sentiment and auto-categorisation land behind the same
-   `routing.service` interface once there is labelled ticket data to justify
-   a model — the interface is designed for it now, the model isn't built now.
+   metadata rules, as built: `routing_rules` matched in an explicit order, then
+   selection on availability, capacity, skill and recency. Sentiment and
+   auto-categorisation would arrive as further criteria feeding the same
+   `RoutingDecision` that `routing.scoring.ts` already produces — the seam is
+   there, the model is not.
 3. **VoIP and social channels deferred.** The channel abstraction (`channel`
    enum + `source_metadata jsonb` + one adapter per channel in `lib/`) is in
    from day one; only email, web form, and product-system API are implemented.

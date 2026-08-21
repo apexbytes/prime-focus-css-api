@@ -10,7 +10,13 @@ import * as auditService from '../audit/audit.service.js';
 import * as authService from '../auth/auth.service.js';
 import * as roleService from '../role/role.service.js';
 import * as repository from './user.repository.js';
-import type { ListUsersFilter, PublicUser, UserStatus, UserWithRole } from './user.types.js';
+import type {
+  AgentAvailability,
+  ListUsersFilter,
+  PublicUser,
+  UserStatus,
+  UserWithRole,
+} from './user.types.js';
 
 const log = createModuleLogger('user');
 
@@ -27,7 +33,61 @@ export function toPublicUser(user: UserWithRole): PublicUser {
     roleName: user.roleName,
     lastLoginAt: user.lastLoginAt,
     createdAt: user.createdAt,
+    availability: user.availability,
+    maxOpenTickets: user.maxOpenTickets,
   };
+}
+
+/**
+ * Sets whether an agent is at their desk, which is what routing reads.
+ *
+ * Not audited: availability changes many times a day and would drown the trail
+ * that exists to answer who changed a customer's data. The last value is on the
+ * row, and assignment decisions are recorded on the ticket.
+ */
+export async function setAvailability(
+  id: string,
+  availability: AgentAvailability,
+  _actor: Actor,
+): Promise<PublicUser> {
+  await requireById(id);
+
+  const row = await repository.update(id, { availability });
+  if (!row) throw AppError.notFound('User not found');
+
+  log.debug('availability changed', { userId: id, availability });
+  return toPublicUser(await requireById(id));
+}
+
+/**
+ * Caps how much work routing will push at one agent. Audited, unlike
+ * availability: it is a supervisor's decision about someone else's workload.
+ */
+export async function setCapacity(
+  id: string,
+  maxOpenTickets: number | null,
+  actor: Actor,
+): Promise<PublicUser> {
+  const before = await requireById(id);
+
+  await withTransaction(async ({ tx }) => {
+    const row = await repository.update(id, { maxOpenTickets }, tx);
+    if (!row) throw AppError.notFound('User not found');
+
+    await auditService.record(
+      {
+        action: 'user.capacity_changed',
+        entityType: 'user',
+        entityId: id,
+        before: { maxOpenTickets: before.maxOpenTickets },
+        after: { maxOpenTickets },
+      },
+      actor,
+      tx,
+    );
+  });
+
+  return toPublicUser(await requireById(id));
 }
 
 export function findById(id: string, exec?: Executor): Promise<UserWithRole | undefined> {

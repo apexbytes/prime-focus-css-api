@@ -2,7 +2,10 @@ import { Router } from 'express';
 import { idempotency, validate } from '../../common/middleware/index.js';
 import { authenticate, requirePermission, requireUserActor } from '../auth/auth.middleware.js';
 import { attachmentRouter } from '../attachment/attachment.routes.js';
+import { ticketEscalationRouter } from '../escalation/escalation.routes.js';
 import { messageRouter } from '../message/message.routes.js';
+import { ticketRoutingRouter } from '../routing/routing.routes.js';
+import { ticketSlaRouter } from '../sla/sla.routes.js';
 import {
   addTicketTag,
   assignTicket,
@@ -115,3 +118,6 @@ ticketRouter.get(
 // belongs, rather than being repeated as a query parameter.
 ticketRouter.use('/:ticketId/messages', messageRouter);
 ticketRouter.use('/:ticketId/attachments', attachmentRouter);
+ticketRouter.use('/:ticketId/sla', ticketSlaRouter);
+ticketRouter.use('/:ticketId/escalations', ticketEscalationRouter);
+ticketRouter.use('/:ticketId/routing', ticketRoutingRouter);

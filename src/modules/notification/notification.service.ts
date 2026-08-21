@@ -116,6 +116,50 @@ export function notifyCustomerReply(
   );
 }
 
+/**
+ * Tells the owner their clock ran out. Deliberately blunt in the title: this
+ * lands in a list of notifications and has to be legible at a glance.
+ */
+export function notifySlaBreach(
+  userId: string,
+  ticket: { id: string; reference: string; subject: string; kind: string },
+  exec?: Executor,
+): Promise<void> {
+  const clock = ticket.kind === 'first_response' ? 'first response' : 'resolution';
+
+  return create(
+    {
+      userId,
+      type: 'sla.breached',
+      title: `${ticket.reference} — ${clock} SLA breached`,
+      body: ticket.subject,
+      entityType: 'ticket',
+      entityId: ticket.id,
+    },
+    exec,
+  );
+}
+
+/** Sent to whoever a rung of the escalation ladder names. */
+export function notifyEscalation(
+  userId: string,
+  ticket: { id: string; reference: string; subject: string },
+  reason: string,
+  exec?: Executor,
+): Promise<void> {
+  return create(
+    {
+      userId,
+      type: 'ticket.escalated',
+      title: `${ticket.reference} escalated`,
+      body: reason,
+      entityType: 'ticket',
+      entityId: ticket.id,
+    },
+    exec,
+  );
+}
+
 export function notifyMention(
   userId: string,
   ticket: { id: string; reference: string },

@@ -3,6 +3,7 @@ import { AppError } from '../../common/errors/index.js';
 import { isUserActor, type Actor } from '../../common/types/actor.js';
 import { withTransaction, type Executor } from '../../db/transaction.js';
 import { createModuleLogger } from '../../lib/logger/index.js';
+import { enqueue, JOB } from '../../lib/queue/index.js';
 import * as auditService from '../audit/audit.service.js';
 import * as categoryService from '../category/category.service.js';
 import * as customerService from '../customer/customer.service.js';
@@ -12,6 +13,7 @@ import * as emailService from '../email/email.service.js';
 import * as messageService from '../message/message.service.js';
 import * as notificationService from '../notification/notification.service.js';
 import * as productService from '../product/product.service.js';
+import * as slaService from '../sla/sla.service.js';
 import * as tagService from '../tag/tag.service.js';
 import * as userService from '../user/user.service.js';
 import type { TicketChannel, TicketPriority, TicketRow, TicketStatus } from './ticket.model.js';
@@ -175,6 +177,19 @@ export async function create(
       );
     }
 
+    // In the transaction, not in the triage job: a ticket whose targets went
+    // missing because the queue was down would look permanently on time, and
+    // nothing would ever escalate it.
+    await slaService.applyTargetsForNewTicket(
+      {
+        id: row.id,
+        productId: row.productId,
+        priority: row.priority,
+        createdAt: row.createdAt,
+      },
+      tx,
+    );
+
     await auditService.record(
       {
         action: 'ticket.created',
@@ -197,6 +212,11 @@ export async function create(
       }
 
       await acknowledgeToCustomer(row, product.name, customer, input);
+
+      // Routing runs after commit so a slow rule set never delays the response
+      // to the customer. `autoassign` leaves an already-owned ticket alone, so a
+      // ticket raised with an explicit assignee is not reassigned.
+      await enqueue(JOB.ticketTriage, { ticketId: row.id });
     });
 
     return row;
@@ -303,6 +323,18 @@ export async function updateFields(
       tx,
     );
     if (!row) throw AppError.notFound('Ticket not found');
+
+    // Waiting on the customer stops the clock; resolving satisfies it. A
+    // priority change deliberately does *not* move a live deadline — the target
+    // owns its own minutes, copied from the policy when it was created.
+    if (patch.status !== undefined) {
+      await slaService.onStatusChanged(
+        { id: row.id, productId: row.productId, priority: row.priority },
+        before.status,
+        row.status,
+        tx,
+      );
+    }
 
     await auditService.record(
       {
@@ -435,6 +467,15 @@ export async function reopen(
       tx,
     );
 
+    // A reopened ticket owes a fresh resolution, measured from now. The first
+    // response already happened, so that clock stays satisfied.
+    await slaService.onStatusChanged(
+      { id: before.id, productId: before.productId, priority: before.priority },
+      before.status,
+      'open',
+      tx,
+    );
+
     await auditService.record(
       {
         action: 'ticket.reopened',
@@ -480,23 +521,39 @@ export async function registerCustomerReply(
     exec,
   );
 
+  // The customer answering is what restarts a clock stopped on `pending`, and
+  // what puts a resolution obligation back on a ticket thought finished.
+  if (reopening || ticket.status === 'pending') {
+    await slaService.onStatusChanged(
+      { id: ticket.id, productId: ticket.productId, priority: ticket.priority },
+      ticket.status,
+      'open',
+      exec,
+    );
+  }
+
   return reopening || ticket.status === 'pending' ? 'open' : ticket.status;
 }
 
 /** Called by the message module on the first public agent reply. */
 export async function registerAgentReply(ticket: TicketRow, exec: Executor): Promise<boolean> {
   const isFirst = ticket.firstResponseAt === null;
+  const now = new Date();
 
   await repository.update(
     ticket.id,
     {
-      lastAgentReplyAt: new Date(),
-      ...(isFirst ? { firstResponseAt: new Date() } : {}),
+      lastAgentReplyAt: now,
+      ...(isFirst ? { firstResponseAt: now } : {}),
       // Replying to a brand-new ticket puts it in play.
       ...(ticket.status === 'new' ? { status: 'open' } : {}),
     },
     exec,
   );
+
+  // Stops the first-response clock, in the same transaction as the reply that
+  // stopped it. Idempotent, so only the first reply counts.
+  if (isFirst) await slaService.markFirstResponse(ticket.id, now, exec);
 
   return isFirst;
 }

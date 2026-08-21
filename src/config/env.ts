@@ -127,6 +127,45 @@ export const envSchema = z.object({
     .default(25 * 1024 * 1024),
   UPLOAD_URL_TTL_SECONDS: z.coerce.number().int().min(60).max(3600).default(900),
 
+  // ---- async jobs ----------------------------------------------------------
+  /**
+   * `inline` runs a job the moment it is enqueued, in the same process, and
+   * never fires a cron schedule. It exists so tests and a database-less
+   * checkout behave the same way the queue does, and defaults to `inline` only
+   * under NODE_ENV=test — see `queueDriver`.
+   */
+  QUEUE_DRIVER: z.enum(['pgboss', 'inline']).optional(),
+  /** pg-boss owns this schema outright; it migrates it itself. */
+  QUEUE_SCHEMA: z.string().min(1).default('pgboss'),
+  /** Workers per job queue in this process. */
+  QUEUE_CONCURRENCY: z.coerce.number().int().min(1).max(50).default(2),
+  /** How long a job may run before pg-boss retries it. */
+  QUEUE_JOB_EXPIRY_SECONDS: z.coerce.number().int().min(30).default(300),
+  QUEUE_RETRY_LIMIT: z.coerce.number().int().min(0).max(20).default(3),
+
+  // ---- service levels ------------------------------------------------------
+  /** Cron for the breach scan. Every minute: an SLA is quoted in minutes. */
+  SLA_SCAN_CRON: z.string().min(1).default('* * * * *'),
+  /**
+   * Tickets examined per scan. A backlog is worked through over successive
+   * runs rather than in one unbounded statement.
+   */
+  SLA_SCAN_BATCH_SIZE: z.coerce.number().int().min(1).max(5000).default(500),
+
+  // ---- routing -------------------------------------------------------------
+  /**
+   * Off leaves every new ticket in the unassigned queue for agents to pick from,
+   * which is how a team that dislikes push assignment runs.
+   */
+  AUTO_ASSIGN_ENABLED: booleanish.default(true),
+  /**
+   * Fallback when nobody matching a rule is `online`. Off means the ticket waits
+   * in the queue rather than landing on an agent who is not at their desk.
+   */
+  ROUTING_ASSIGN_TO_AWAY_AGENTS: booleanish.default(false),
+  /** Open tickets an agent may hold before routing skips them. */
+  DEFAULT_AGENT_MAX_OPEN_TICKETS: z.coerce.number().int().min(1).max(500).default(20),
+
   // ---- seed ----------------------------------------------------------------
   SEED_ADMIN_EMAIL: z.string().min(3).default('admin@primefocus.co.zw'),
   SEED_ADMIN_NAME: z.string().min(1).default('Prime Focus Administrator'),
@@ -219,6 +258,17 @@ export const corsOrigins: string[] | '*' =
 /** `resend` when a key is configured, otherwise `log`. */
 export const emailTransport: 'resend' | 'log' =
   env.EMAIL_TRANSPORT ?? (env.RESEND_API_KEY ? 'resend' : 'log');
+
+/**
+ * `inline` under test so a suite that never starts a queue still exercises the
+ * job handlers; `pgboss` everywhere else, including development, where the
+ * Docker database is already running and the cron surface is the point.
+ *
+ * Setting `QUEUE_DRIVER=inline` in production is allowed but means no schedule
+ * ever fires — the queue module warns about it at boot.
+ */
+export const queueDriver: 'pgboss' | 'inline' =
+  env.QUEUE_DRIVER ?? (env.NODE_ENV === 'test' ? 'inline' : 'pgboss');
 
 /**
  * `s3` once a bucket and credentials exist, otherwise the local-disk backend so
