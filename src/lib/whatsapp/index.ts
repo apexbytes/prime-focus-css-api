@@ -214,6 +214,160 @@ function redact(value: string): string {
   return value.length <= 4 ? '****' : `****${value.slice(-4)}`;
 }
 
+// -- inbound media ------------------------------------------------------------
+
+export interface FetchedMedia {
+  bytes: Buffer;
+  mimeType: string;
+  /** Meta's own digest, for comparison against the webhook's. */
+  sha256: string | null;
+  fileSize: number;
+}
+
+/** What the metadata call answers, before any bytes move. */
+export interface MediaDescriptor {
+  url: string;
+  mimeType: string;
+  sha256: string | null;
+  fileSize: number;
+}
+
+/**
+ * Resolves a media id to a download URL.
+ *
+ * Two calls are needed and this is the first, because a webhook carries a media
+ * **id** and never usable bytes. The URL this returns lives for about five
+ * minutes, which is the reason the whole media path runs inside
+ * `channel.inbound.process` rather than lazily when an agent opens the ticket:
+ * by then it would be dead.
+ *
+ * The id itself is good for seven days, so a retry a day later still works —
+ * which is why nothing stores the URL and everything stores the id.
+ */
+export async function fetchMediaDescriptor(mediaId: string): Promise<MediaDescriptor> {
+  const query = env.WHATSAPP_PHONE_NUMBER_ID
+    ? `?phone_number_id=${encodeURIComponent(env.WHATSAPP_PHONE_NUMBER_ID)}`
+    : '';
+
+  const response = await authorisedGet(
+    `${env.WHATSAPP_API_BASE_URL}/${GRAPH_VERSION}/${encodeURIComponent(mediaId)}${query}`,
+  );
+
+  const text = await response.text();
+  if (!response.ok) {
+    throw new Error(
+      `whatsapp media lookup failed: ${extractError(text) ?? `HTTP ${response.status}`}`,
+    );
+  }
+
+  const parsed = JSON.parse(text) as {
+    url?: string;
+    mime_type?: string;
+    sha256?: string;
+    file_size?: number;
+  };
+
+  if (!parsed.url) throw new Error('whatsapp media lookup returned no url');
+
+  return {
+    url: parsed.url,
+    mimeType: parsed.mime_type ?? 'application/octet-stream',
+    sha256: parsed.sha256 ?? null,
+    fileSize: Number(parsed.file_size ?? 0),
+  };
+}
+
+/**
+ * Downloads the bytes.
+ *
+ * The URL looks like a public CDN link and is not: the same bearer token has to
+ * be presented again, and a bare fetch gets a 401. That is the single most
+ * common way to get this wrong, which is why both halves live behind
+ * `fetchWhatsappMedia` and no caller ever holds the URL.
+ */
+export async function downloadMedia(descriptor: MediaDescriptor): Promise<Buffer> {
+  const response = await authorisedGet(descriptor.url);
+
+  if (!response.ok) {
+    throw new Error(`whatsapp media download failed: HTTP ${response.status}`);
+  }
+
+  return Buffer.from(await response.arrayBuffer());
+}
+
+/**
+ * Both calls, with the size checked between them.
+ *
+ * `maxBytes` is enforced against the metadata rather than after the download, so
+ * an oversized file costs one small request instead of being streamed into
+ * memory and thrown away. Meta's own per-type caps go to 100 MB for documents,
+ * which is well past what this system accepts.
+ */
+async function fetchMediaOverHttp(
+  mediaId: string,
+  options: { maxBytes: number },
+): Promise<FetchedMedia> {
+  const descriptor = await fetchMediaDescriptor(mediaId);
+
+  if (descriptor.fileSize > options.maxBytes) {
+    throw new MediaTooLargeError(descriptor.fileSize, options.maxBytes);
+  }
+
+  const bytes = await downloadMedia(descriptor);
+
+  return {
+    bytes,
+    mimeType: descriptor.mimeType,
+    sha256: descriptor.sha256,
+    fileSize: bytes.byteLength,
+  };
+}
+
+/**
+ * Refused before the bytes move, and its own type so the caller can tell "this
+ * file is too big" — which the customer must be told about — from "Meta is
+ * down", which is worth retrying.
+ */
+export class MediaTooLargeError extends Error {
+  constructor(
+    readonly fileSize: number,
+    readonly maxBytes: number,
+  ) {
+    super(`media is ${fileSize} bytes, over the ${maxBytes}-byte limit`);
+    this.name = 'MediaTooLargeError';
+  }
+}
+
+/**
+ * Test seam, and the same one the inbound email pipeline uses for the same
+ * reason: a webhook carries no bytes, so the only way to exercise this path
+ * without a live Meta account is to substitute the retrieval step.
+ */
+let mediaFetcher = fetchMediaOverHttp;
+
+export function __setMediaFetcher(
+  override: ((mediaId: string, options: { maxBytes: number }) => Promise<FetchedMedia>) | null,
+): void {
+  mediaFetcher = override ?? fetchMediaOverHttp;
+}
+
+export function fetchWhatsappMedia(
+  mediaId: string,
+  options: { maxBytes: number },
+): Promise<FetchedMedia> {
+  return mediaFetcher(mediaId, options);
+}
+
+function authorisedGet(url: string): Promise<Response> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), env.WHATSAPP_HTTP_TIMEOUT_MS);
+
+  return fetch(url, {
+    headers: { authorization: `Bearer ${env.WHATSAPP_ACCESS_TOKEN ?? ''}` },
+    signal: controller.signal,
+  }).finally(() => clearTimeout(timeout));
+}
+
 // -- inbound signature --------------------------------------------------------
 
 export const SIGNATURE_HEADER = 'x-hub-signature-256';

@@ -438,6 +438,83 @@ async function requireAccessible(id: string, actor: Actor): Promise<AttachmentRo
   return row;
 }
 
+// -- inbound channel media ----------------------------------------------------
+
+/**
+ * Stores a file that arrived on a channel, with the bytes already in hand.
+ *
+ * Distinct from the upload endpoints above rather than a reuse of them, because
+ * the shape is genuinely different: there is no client to hand a presigned URL
+ * to, no `pending` state to confirm, and no actor — the caller is the inbound
+ * pipeline, which is the authority on this ticket for the same reason
+ * `recordCustomerMessage` needs no access check. What it shares is everything
+ * that matters: the same denylist, the same size cap, the same object store, and
+ * the same `attachment.scan` job settling the row, so a file from WhatsApp is
+ * exactly as unscanned-until-proven as one from a browser.
+ *
+ * The row is attributed to the **customer**, never a user: an agent did not
+ * upload this.
+ */
+export async function storeInboundMedia(input: {
+  ticketId: string;
+  messageId: string;
+  customerId: string;
+  filename: string;
+  contentType: string;
+  bytes: Buffer;
+  checksum?: string | null | undefined;
+}): Promise<AttachmentRow> {
+  // The same guard the upload path applies. A customer-supplied filename is
+  // untrusted input, so it is checked here and never used as a storage key —
+  // `buildStorageKey` generates that.
+  assertAllowed(input.filename, input.bytes.byteLength);
+
+  const storageKey = buildStorageKey(input.ticketId, input.filename);
+  const checksum = await putObject(storageKey, input.bytes, input.contentType);
+
+  const row = await withTransaction(async ({ tx }) => {
+    const created = await repository.insert(
+      {
+        ticketId: input.ticketId,
+        messageId: input.messageId,
+        filename: input.filename,
+        contentType: input.contentType,
+        sizeBytes: input.bytes.byteLength,
+        storageKey,
+        // `uploaded`, not `clean`: nothing has scanned it. The job settles it,
+        // and until it does the console shows it as unscanned.
+        status: 'uploaded',
+        checksum: input.checksum ?? checksum,
+        uploadedByCustomerId: input.customerId,
+        uploadedAt: new Date(),
+      },
+      tx,
+    );
+
+    await auditService.record(
+      {
+        action: 'attachment.received',
+        entityType: 'ticket',
+        entityId: input.ticketId,
+        after: { attachmentId: created.id, filename: created.filename, source: 'channel' },
+      },
+      { kind: 'system', name: 'channel.inbound' },
+      tx,
+    );
+
+    return created;
+  });
+
+  log.info('inbound channel media stored', {
+    attachmentId: row.id,
+    ticketId: input.ticketId,
+    sizeBytes: input.bytes.byteLength,
+  });
+
+  await enqueue(JOB.attachmentScan, { attachmentId: row.id });
+  return (await repository.findById(row.id)) ?? row;
+}
+
 // -- retention ---------------------------------------------------------------
 
 /**

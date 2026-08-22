@@ -5,7 +5,13 @@ import { withTransaction, type Executor } from '../../db/transaction.js';
 import { createModuleLogger } from '../../lib/logger/index.js';
 import { enqueue, JOB } from '../../lib/queue/index.js';
 import { broadcast } from '../../lib/socket/index.js';
-import { sendWhatsappTemplate, sendWhatsappText } from '../../lib/whatsapp/index.js';
+import {
+  fetchWhatsappMedia,
+  MediaTooLargeError,
+  sendWhatsappTemplate,
+  sendWhatsappText,
+} from '../../lib/whatsapp/index.js';
+import * as attachmentService from '../attachment/attachment.service.js';
 import { CHAT_EVENT, CHAT_ROOM } from '../chat/chat.types.js';
 import * as customerService from '../customer/customer.service.js';
 import * as emailService from '../email/email.service.js';
@@ -31,6 +37,7 @@ import {
   type InboundProcessResult,
   type InboundRecordResult,
   type ListConversationsFilter,
+  type NormalisedInboundMedia,
   type NormalisedInboundMessage,
 } from './conversation.types.js';
 
@@ -65,6 +72,7 @@ export async function recordInbound(
     fromIdentifier: message.fromIdentifier,
     displayName: message.displayName ?? null,
     body: message.body,
+    media: message.media ?? null,
     payload: message.payload,
     ...(message.occurredAt ? { receivedAt: message.occurredAt } : {}),
   });
@@ -114,11 +122,13 @@ export async function processInbound(inboundId: string): Promise<InboundProcessR
     return { status: 'ignored', reason: `channel ${channel} has no conversation pipeline` };
   }
 
-  const body = inbound.body?.trim();
-  if (!body) {
-    // A sticker, a location pin, a reaction: nothing this desk can act on and
-    // nothing an agent can read. Recorded and dropped rather than filed as an
-    // empty message that looks like a bug in the thread.
+  const media = (inbound.media ?? null) as NormalisedInboundMedia | null;
+  const caption = inbound.body?.trim();
+
+  // A message is actionable if it has words *or* a file. Only a message with
+  // neither — a location pin, a reaction, a contact card — is dropped, and even
+  // then it is recorded with a reason rather than vanishing.
+  if (!caption && !media) {
     await settle(inbound.id, 'ignored', 'no readable body');
     return { status: 'ignored', reason: 'no readable body' };
   }
@@ -129,7 +139,10 @@ export async function processInbound(inboundId: string): Promise<InboundProcessR
       externalId: inbound.conversationExternalId,
       fromIdentifier: inbound.fromIdentifier,
       displayName: inbound.displayName,
-      body,
+      // A file with no caption still needs a body: a thread entry with no text
+      // reads as a bug, and the subject of a new ticket comes from it.
+      body: caption || describeMedia(media as NormalisedInboundMedia),
+      ...(media ? { media } : {}),
     });
   } catch (error) {
     const reason = error instanceof Error ? error.message : 'unknown error';
@@ -145,6 +158,7 @@ interface FilingInput {
   fromIdentifier: string;
   displayName: string | null;
   body: string;
+  media?: NormalisedInboundMedia | undefined;
 }
 
 async function file(inboundId: string, input: FilingInput): Promise<InboundProcessResult> {
@@ -171,7 +185,7 @@ async function appendToTicket(
   ticketId: string,
   input: FilingInput,
 ): Promise<InboundProcessResult> {
-  return withTransaction(async ({ tx, afterCommit }) => {
+  const filed = await withTransaction(async ({ tx, afterCommit }) => {
     const ticket = await ticketService.findRawById(ticketId, tx);
     if (!ticket) throw new Error(`ticket ${ticketId} vanished mid-processing`);
 
@@ -241,6 +255,9 @@ async function appendToTicket(
       ticketMessageId: message.id,
     };
   });
+
+  await attachMedia(input, filed.ticketId, filed.ticketMessageId, conversation.customerId);
+  return filed;
 }
 
 async function openTicket(
@@ -292,6 +309,10 @@ async function openTicket(
     processedAt: new Date(),
   });
 
+  // Before the acknowledgement, so an agent opening the ticket because of it
+  // finds the file already there.
+  await attachMedia(input, created.id, await openingMessageId(created.id), conversation.customerId);
+
   await acknowledgeInChannel(input.channel, opened, created.reference, product.name);
 
   log.info('inbound channel message opened a ticket', {
@@ -307,6 +328,111 @@ async function openTicket(
     ticketId: created.id,
     created: true,
   };
+}
+
+/**
+ * Fetches a file that came with the message and puts it on the ticket.
+ *
+ * Runs **after** the message is committed, never inside its transaction: this
+ * makes two HTTP calls to Meta and writes to object storage, and holding a
+ * Postgres transaction open across all of that would be a lock held for a
+ * network round trip. The consequence is deliberate and stated: a failure here
+ * leaves the customer's words on the ticket without their file, which is far
+ * better than losing the message because a download timed out.
+ *
+ * The provider **id** is resolved here rather than at webhook time because a
+ * download URL lives about five minutes. The id lives a week, so a job retried
+ * tomorrow still works — which is the whole reason the id is what gets stored.
+ */
+async function attachMedia(
+  input: FilingInput,
+  ticketId: string,
+  messageId: string | undefined,
+  customerId: string,
+): Promise<void> {
+  if (!input.media || !messageId) return;
+
+  const media = input.media;
+
+  try {
+    const fetched = await fetchWhatsappMedia(media.providerMediaId, {
+      maxBytes: env.ATTACHMENT_MAX_BYTES,
+    });
+
+    await attachmentService.storeInboundMedia({
+      ticketId,
+      messageId,
+      customerId,
+      filename: filenameFor(media, fetched.mimeType),
+      contentType: media.mimeType ?? fetched.mimeType,
+      bytes: fetched.bytes,
+      checksum: fetched.sha256,
+    });
+  } catch (error) {
+    // A file too large is the customer's problem to hear about, not an outage:
+    // they are told in the thread, because otherwise they have sent something
+    // into a void and are waiting for an answer about it.
+    if (error instanceof MediaTooLargeError) {
+      log.info('inbound media refused for size', { ticketId, fileSize: error.fileSize });
+      await messageService.recordSystemMessage({
+        ticketId,
+        body: `The customer sent a ${media.kind} of ${Math.round(error.fileSize / 1024)}KB, which is over the ${Math.floor(error.maxBytes / 1024 / 1024)}MB limit and was not stored. Ask them to send it another way.`,
+      });
+      return;
+    }
+
+    // Everything else is ours: Meta being down, an expired id, storage
+    // refusing. The message stands; the note is how an agent knows why there is
+    // no file on a ticket that plainly mentions one.
+    log.error('failed to attach inbound media', { ticketId, kind: media.kind, err: error });
+    await messageService.recordSystemMessage({
+      ticketId,
+      body: `A ${media.kind} the customer sent could not be retrieved from WhatsApp. It may be requeued from the inbound backlog within seven days.`,
+    });
+  }
+}
+
+/**
+ * The opening message a ticket was created with, so an attachment can hang off
+ * the entry that mentions it rather than off the ticket alone.
+ *
+ * Read back rather than returned by `create`, because ticket creation answers
+ * with a `TicketSummary` and widening it so this one caller can have a message
+ * id would put a field on every ticket response in the system.
+ */
+async function openingMessageId(ticketId: string): Promise<string | undefined> {
+  const thread = await messageService.customerVisibleThread(ticketId, 1);
+  return thread[0]?.id;
+}
+
+/**
+ * A name for a file that mostly arrives without one.
+ *
+ * Only documents carry a filename, and a customer-supplied one is untrusted —
+ * it never becomes a storage key (`buildStorageKey` generates that) and it is
+ * stripped to a basename here so a name like `../../etc/passwd` is just
+ * `passwd` in the console.
+ */
+function filenameFor(media: NormalisedInboundMedia, fallbackMime: string): string {
+  if (media.filename) {
+    const base = media.filename.replace(/^.*[\\/]/, '').trim();
+    if (base) return base.slice(0, 200);
+  }
+
+  const mime = media.mimeType ?? fallbackMime;
+  const extension = mime.split('/')[1]?.split(';')[0] ?? 'bin';
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+
+  return `${media.kind}-${stamp}.${extension}`;
+}
+
+/** What the thread says when a file arrives with no caption. */
+function describeMedia(media: NormalisedInboundMedia): string {
+  if (media.kind === 'audio' && media.voice) return 'Sent a voice note.';
+  if (media.kind === 'document') {
+    return media.filename ? `Sent a document (${media.filename}).` : 'Sent a document.';
+  }
+  return `Sent ${media.kind === 'image' ? 'an image' : `a ${media.kind}`}.`;
 }
 
 /**

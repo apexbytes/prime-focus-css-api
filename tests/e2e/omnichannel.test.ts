@@ -10,7 +10,12 @@ import { env } from '../../src/config/index.js';
 import { closeDatabase, db } from '../../src/db/client.js';
 import { readOutbox } from '../../src/lib/resend/index.js';
 import { stopSocketServer } from '../../src/lib/socket/index.js';
-import { readWhatsappOutbox } from '../../src/lib/whatsapp/index.js';
+import {
+  __setMediaFetcher,
+  MediaTooLargeError,
+  readWhatsappOutbox,
+} from '../../src/lib/whatsapp/index.js';
+import { attachments } from '../../src/modules/attachment/attachment.model.js';
 import { startChat } from '../../src/modules/chat/index.js';
 import {
   channelConversations,
@@ -56,6 +61,8 @@ interface InboundOptions {
   body?: string;
   profileName?: string;
   type?: string;
+  /** A media object under the key its `type` names, as Meta sends it. */
+  media?: Record<string, unknown>;
 }
 
 function messagesEnvelope(options: InboundOptions = {}): unknown {
@@ -83,7 +90,7 @@ function messagesEnvelope(options: InboundOptions = {}): unknown {
                   timestamp: String(Math.floor(Date.now() / 1000)),
                   type: options.type ?? 'text',
                   ...(options.type && options.type !== 'text'
-                    ? {}
+                    ? { [options.type]: options.media ?? {} }
                     : { text: { body: options.body ?? 'My transfer has not arrived.' } }),
                 },
               ],
@@ -263,7 +270,9 @@ describe.skipIf(!enabled)('phase 8: omnichannel channels', () => {
     });
 
     it('records a message it cannot read instead of dropping it', async () => {
-      await postWhatsapp(messagesEnvelope({ type: 'image', id: 'wamid.image' }));
+      // A location pin: no words and no file, so there is nothing to act on.
+      // Media is a different case entirely — see the media block below.
+      await postWhatsapp(messagesEnvelope({ type: 'location', id: 'wamid.pin' }));
 
       const [inbound] = await db.select().from(inboundChannelMessages);
       // Visible in the operator's backlog with a reason, which is the difference
@@ -291,6 +300,168 @@ describe.skipIf(!enabled)('phase 8: omnichannel channels', () => {
         .query({ 'hub.mode': 'subscribe', 'hub.verify_token': 'nope', 'hub.challenge': 'x' });
 
       expect(wrongToken.status).toBe(403);
+    });
+  });
+
+  // -- inbound media ---------------------------------------------------------
+
+  describe('an inbound WhatsApp file', () => {
+    const PHOTO = Buffer.from('\xff\xd8\xff\xe0 not really a jpeg', 'binary');
+
+    /** Stands in for Meta's two-call retrieval; the real thing needs an account. */
+    function serveMedia(
+      bytes: Buffer = PHOTO,
+      mimeType = 'image/jpeg',
+      fileSize = bytes.byteLength,
+    ): string[] {
+      const asked: string[] = [];
+
+      __setMediaFetcher((mediaId, options) => {
+        asked.push(mediaId);
+        if (fileSize > options.maxBytes) {
+          return Promise.reject(new MediaTooLargeError(fileSize, options.maxBytes));
+        }
+        return Promise.resolve({ bytes, mimeType, sha256: 'abc123', fileSize });
+      });
+
+      return asked;
+    }
+
+    afterEach(() => {
+      __setMediaFetcher(null);
+    });
+
+    function imageEnvelope(media: Record<string, unknown> = {}, id = 'wamid.photo'): unknown {
+      return messagesEnvelope({
+        type: 'image',
+        id,
+        media: { id: 'media-1', mime_type: 'image/jpeg', sha256: 'abc123', ...media },
+      });
+    }
+
+    it('downloads a captioned photo onto the ticket it opens', async () => {
+      const asked = serveMedia();
+
+      await postWhatsapp(imageEnvelope({ caption: 'This is the ATM screen.' }));
+
+      // The id was resolved, not a URL from the webhook — the webhook has none.
+      expect(asked).toEqual(['media-1']);
+
+      const [ticket] = await db.select().from(tickets);
+      // The caption is the customer's words, so it is the body and the subject.
+      expect(ticket?.subject).toBe('This is the ATM screen.');
+
+      const [attachment] = await db.select().from(attachments);
+      expect(attachment?.ticketId).toBe(ticket?.id);
+      expect(attachment?.contentType).toBe('image/jpeg');
+      expect(attachment?.sizeBytes).toBe(PHOTO.byteLength);
+      // Attributed to the customer, never to an agent, and hung off the thread
+      // entry that mentions it rather than off the ticket alone.
+      expect(attachment?.uploadedByCustomerId).toBe(ticket?.customerId);
+      expect(attachment?.messageId).not.toBeNull();
+      // `uploaded` or a settled scan state — never `clean` by assumption. The
+      // test antivirus driver is `none`, so the job settles it as `skipped`.
+      expect(['uploaded', 'skipped', 'clean']).toContain(attachment?.status);
+    });
+
+    it('gives an uncaptioned photo a body and a name of its own', async () => {
+      serveMedia();
+
+      await postWhatsapp(imageEnvelope());
+
+      const [ticket] = await db.select().from(tickets);
+      // A thread entry with no text reads as a bug, so the pipeline says what
+      // arrived instead of filing an empty message.
+      expect(ticket?.subject).toBe('Sent an image.');
+
+      const [attachment] = await db.select().from(attachments);
+      expect(attachment?.filename).toMatch(/^image-.*\.jpeg$/);
+    });
+
+    it('keeps a document’s name but never trusts it as a path', async () => {
+      serveMedia(Buffer.from('%PDF-1.4 statement'), 'application/pdf');
+
+      await postWhatsapp(
+        messagesEnvelope({
+          type: 'document',
+          id: 'wamid.doc',
+          media: {
+            id: 'media-2',
+            mime_type: 'application/pdf',
+            filename: '../../etc/passwd/statement.pdf',
+          },
+        }),
+      );
+
+      const [attachment] = await db.select().from(attachments);
+      // Stripped to a basename: a filename from a customer is untrusted input,
+      // and the storage key is generated rather than derived from it.
+      expect(attachment?.filename).toBe('statement.pdf');
+      expect(attachment?.storageKey).not.toContain('etc/passwd');
+
+      const [ticket] = await db.select().from(tickets);
+      expect(ticket?.subject).toBe('Sent a document (../../etc/passwd/statement.pdf).');
+    });
+
+    it('refuses an oversized file before downloading it, and says so in the thread', async () => {
+      // 40MB claimed in the metadata: over the cap, and never fetched.
+      serveMedia(PHOTO, 'image/jpeg', 40 * 1024 * 1024);
+
+      await postWhatsapp(imageEnvelope({ caption: 'Here is the video of the machine.' }));
+
+      // The customer is not ignored: their words are on a ticket.
+      const [ticket] = await db.select().from(tickets);
+      expect(ticket?.subject).toBe('Here is the video of the machine.');
+      expect(await db.select().from(attachments)).toHaveLength(0);
+
+      // And an agent is told why there is no file, in the one place they look.
+      const notes = await db
+        .select()
+        .from(ticketMessages)
+        .where(
+          and(eq(ticketMessages.ticketId, ticket!.id), eq(ticketMessages.authorType, 'system')),
+        );
+
+      expect(notes.some((note) => note.body.includes('over the'))).toBe(true);
+      expect(notes.some((note) => note.body.includes('another way'))).toBe(true);
+    });
+
+    it('keeps the message when the download fails, and stays retryable', async () => {
+      __setMediaFetcher(() => Promise.reject(new Error('graph.facebook.com is having a day')));
+
+      await postWhatsapp(imageEnvelope({ caption: 'Receipt attached.' }));
+
+      // The words survive: losing a customer's message because a download timed
+      // out would be far worse than a ticket with no file on it.
+      const [ticket] = await db.select().from(tickets);
+      expect(ticket?.subject).toBe('Receipt attached.');
+      expect(await db.select().from(attachments)).toHaveLength(0);
+
+      const notes = await db
+        .select()
+        .from(ticketMessages)
+        .where(
+          and(eq(ticketMessages.ticketId, ticket!.id), eq(ticketMessages.authorType, 'system')),
+        );
+      expect(notes.some((note) => note.body.includes('could not be retrieved'))).toBe(true);
+
+      // The inbound row is `processed` — the message was filed — and the media
+      // id it still holds is what a later retry would resolve.
+      const [inbound] = await db.select().from(inboundChannelMessages);
+      expect(inbound?.status).toBe('processed');
+      expect(inbound?.media).toMatchObject({ providerMediaId: 'media-1', kind: 'image' });
+    });
+
+    it('attaches a file to a reply on a ticket that is already open', async () => {
+      serveMedia();
+      await postWhatsapp(messagesEnvelope());
+      const [ticket] = await db.select().from(tickets);
+
+      await postWhatsapp(imageEnvelope({ caption: 'Photo of the receipt.' }, 'wamid.later'));
+
+      expect(await db.select().from(tickets)).toHaveLength(1);
+      const [attachment] = await db.select().from(attachments);
+      expect(attachment?.ticketId).toBe(ticket?.id);
     });
   });
 

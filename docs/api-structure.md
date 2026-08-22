@@ -374,6 +374,12 @@ alternative — a row per ticket — makes "which thread is this message on" a
 most-recent-open query with a race in it, and leaves nowhere to keep
 `window_expires_at`, which belongs to the thread and to no ticket in it.
 
+`inbound_channel_messages.media` holds the normalised descriptor of a file that
+came with the message — its provider **id**, mime type and digest, never a URL. A
+provider's download URL lives about five minutes and the id lives seven days, so
+the id is the only thing worth persisting; its own column rather than re-parsed
+out of `payload` on each retry, which would put the same parsing in two places.
+
 `inbound_channel_messages` is unique on `provider_message_id`, which is the
 deduplication: Meta redelivers any webhook it did not get a prompt 2xx for, and a
 redelivery must not become a second message in the customer's thread.
@@ -1359,11 +1365,33 @@ Decisions worth knowing:
   envelope is not mistaken for an empty message envelope, but nothing is stored:
   this system does not show a customer's read state to agents, and a row per
   receipt on a busy number is a large table nobody reads.
-- **Media is recorded, not fetched.** A photo of a failed ATM screen is exactly
-  the attachment an agent wants, and downloading it means Meta's media endpoint,
-  the object store, the virus scanner and a retention rule — four things, not
-  one. Until then the message is filed as `ignored` with `no readable body`,
-  which is visible in the operator backlog rather than silently absent.
+- **Media is downloaded, and the id is why it can be.** Added as a follow-up
+  shortly after the phase, because a photo of a failed ATM screen is exactly the
+  attachment an agent wants. A webhook carries a media **id**, never bytes and
+  never a usable URL: resolving it is a second call that returns a URL good for
+  about five minutes, while the id itself is good for seven days. So the id is
+  what gets stored — in a `media` column on the inbound row, normalised, rather
+  than re-parsed out of `payload` on every retry — and a job retried tomorrow
+  still works where a stored URL would be long dead. The download runs inside
+  `channel.inbound.process` for that reason, not lazily when an agent opens the
+  ticket.
+
+  It runs **after** the message commits, never inside its transaction: two calls
+  to Meta plus an object-store write is a network round trip to hold a Postgres
+  lock across. The consequence is deliberate — a failure leaves the customer's
+  words on the ticket without their file, which is far better than losing the
+  message because a download timed out — and either way an agent gets a system
+  note saying why there is no file on a ticket that plainly mentions one. An
+  oversized file is refused on the metadata, before any bytes move, and the note
+  says to ask the customer for it another way.
+
+  What it reuses matters more than what it added: the same denylist, the same
+  `ATTACHMENT_MAX_BYTES` cap, the same object store and the same
+  `attachment.scan` job — so a file from WhatsApp is exactly as
+  unscanned-until-proven as one from a browser, and the retention sweep already
+  deletes it with the ticket. A customer-supplied filename is stripped to a
+  basename and never becomes a storage key.
+
 - **CSAT is skipped, not adapted.** The survey is an email with a tokenised link;
   asking for a score over WhatsApp needs an approved template and a way to read a
   digit back as a rating. `dispatch` answers `skipped` with a reason, because
@@ -1488,6 +1516,14 @@ or malformed — never `process.env.X` anywhere else in the codebase.
   refusals that matter — a visitor token on the staff namespace and a staff token
   on the chat one. A stubbed ingress would assert that our own code was called
   and prove nothing about either.
+
+  Media retrieval is the one part stubbed, at the `lib/whatsapp` boundary and for
+  the reason the inbound email body is stubbed there: a webhook carries no bytes,
+  so without a live Meta account there is nothing to fetch. What the stub does
+  not cover is named — the two HTTP calls themselves — and everything after them
+  is real: the size refusal, the filename stripping, the attachment row, the scan
+  job, and the system note when a download fails.
+
 - **Authorisation matrix** — a table-driven test asserting each role × endpoint
   outcome. This is the one suite that must never be skipped: RBAC regressions
   in a fintech leak customer financial data.
@@ -1521,10 +1557,12 @@ Called out so the trade-offs are explicit, not silently dropped:
    VoIP is still out, and deliberately rather than by omission: a voice channel
    is not another text adapter. It needs a recording store, a transcription step
    and a retention argument of its own, and adding `phone` to the enum without
-   them would be schema pretending to be a feature. Two smaller gaps inside the
-   channels that _are_ built, stated rather than hidden: inbound media is
-   recorded as unreadable rather than downloaded, and CSAT is skipped for a
-   customer with no address instead of being asked over the channel.
+   them would be schema pretending to be a feature.
+
+   One gap remains inside the channels that _are_ built, stated rather than
+   hidden: CSAT is skipped for a customer with no address rather than asked over
+   the channel, which needs an approved template and a way to read a digit back
+   as a rating. Inbound media was the other one and is now built — see §8.
 
 4. **Data lake → materialised views.** Real-time dashboards come from Postgres
    materialised views refreshed on a schedule, as built in Phase 5: six views,

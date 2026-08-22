@@ -11,12 +11,34 @@ import { CONVERSATION_CHANNELS } from './conversation.types.js';
  * cannot afford to reject — and what actually matters, the signature, is checked
  * before this schema ever runs.
  */
-const whatsappTextMessage = z.object({
+/**
+ * Every media type carries the same core: an **id**, never a URL. Resolving it
+ * is two further calls — see `lib/whatsapp`. `caption` appears on images,
+ * videos and documents; `filename` only on documents; `voice` distinguishes a
+ * recorded note from an attached audio file.
+ */
+const whatsappMedia = z
+  .object({
+    id: z.string().min(1),
+    mime_type: z.string().optional(),
+    sha256: z.string().optional(),
+    caption: z.string().optional(),
+    filename: z.string().optional(),
+    voice: z.boolean().optional(),
+  })
+  .loose();
+
+const whatsappInboundMessage = z.object({
   from: z.string().min(1),
   id: z.string().min(1),
   timestamp: z.string().optional(),
   type: z.string(),
   text: z.object({ body: z.string() }).optional(),
+  image: whatsappMedia.optional(),
+  document: whatsappMedia.optional(),
+  audio: whatsappMedia.optional(),
+  video: whatsappMedia.optional(),
+  sticker: whatsappMedia.optional(),
   /** Present on a reply to one of our own messages; kept for the payload log. */
   context: z.object({ id: z.string().optional() }).loose().optional(),
 });
@@ -44,7 +66,7 @@ const whatsappValue = z.object({
         .loose(),
     )
     .optional(),
-  messages: z.array(whatsappTextMessage).optional(),
+  messages: z.array(whatsappInboundMessage).optional(),
   statuses: z.array(whatsappStatus).optional(),
 });
 
@@ -63,7 +85,7 @@ export const whatsappWebhookBody = z.object({
 });
 
 export type WhatsappWebhookBody = z.infer<typeof whatsappWebhookBody>;
-export type WhatsappInboundMessage = z.infer<typeof whatsappTextMessage>;
+export type WhatsappInboundMessage = z.infer<typeof whatsappInboundMessage>;
 
 /**
  * Meta's webhook URL verification, which arrives as a `GET` with the token in

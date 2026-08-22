@@ -21,6 +21,29 @@ export function isConversationChannel(channel: TicketChannel): channel is Conver
   return (CONVERSATION_CHANNELS as readonly string[]).includes(channel);
 }
 
+/** The media kinds a channel can hand us, in this system's own words. */
+export const MEDIA_KINDS = ['image', 'document', 'audio', 'video', 'sticker'] as const;
+
+export type MediaKind = (typeof MEDIA_KINDS)[number];
+
+/**
+ * A file attached to an inbound message, as the adapter describes it.
+ *
+ * The **id**, not a URL, and that is the whole design: a provider's download URL
+ * lives about five minutes while the id is good for a week, so storing the id is
+ * what makes a retry tomorrow work. Nothing here has fetched anything yet.
+ */
+export interface NormalisedInboundMedia {
+  kind: MediaKind;
+  providerMediaId: string;
+  mimeType: string | null;
+  sha256: string | null;
+  /** Only documents carry one; everything else gets a name generated for it. */
+  filename: string | null;
+  /** True for a recorded voice note rather than an attached audio file. */
+  voice?: boolean | undefined;
+}
+
 /**
  * One inbound message, as the channel's adapter has normalised it.
  *
@@ -39,6 +62,8 @@ export interface NormalisedInboundMessage {
   fromIdentifier: string;
   displayName?: string | undefined;
   body: string | null;
+  /** A file that came with it, if any. Fetched later, by the filing job. */
+  media?: NormalisedInboundMedia | undefined;
   /** Which product this lands in, when the channel can tell. */
   productId?: string | undefined;
   /** The envelope as received. */
