@@ -87,6 +87,91 @@ they should hold. They receive a link, choose a password at
 Seeded roles: `super_admin`, `admin`, `tier2_specialist`, `tier1_agent`. Only
 `super_admin` can change what a role may do.
 
+### Taking someone off the desk
+
+Three separate acts, deliberately not one:
+
+```bash
+# perm user:manage. Reversible; sessions and trusted devices are revoked.
+curl -X PATCH localhost:3000/api/v1/users/$ID/status \
+  -H "authorization: Bearer $TOKEN" -H 'content-type: application/json' \
+  -d '{"status":"suspended"}'
+
+# perm user:invite. Only before the link is used.
+curl -X DELETE localhost:3000/api/v1/invitations/$INVITATION_ID \
+  -H "authorization: Bearer $TOKEN"
+
+# perm user:delete. Off the roster for good.
+curl -X DELETE localhost:3000/api/v1/users/$ID \
+  -H "authorization: Bearer $TOKEN"
+```
+
+Deleting is a soft delete: the row stays so that audit entries, ticket history
+and old assignments keep resolving to a name, but the account disappears from
+`GET /api/v1/users`, its sessions and trusted devices are revoked, any invitation
+link still sitting in an inbox stops working, and the email address is released
+so the person can be invited again later. The address is preserved in the
+`user.deleted` audit entry, which is the only place it survives.
+
+Three refusals, all `409`:
+
+| Code                    | When                                                  |
+| ----------------------- | ----------------------------------------------------- |
+| `SELF_ACTION_FORBIDDEN` | You are deleting your own account                     |
+| `LAST_SUPER_ADMIN`      | It is the only active super administrator             |
+| `USER_HAS_OPEN_TICKETS` | Their queue is not empty — reassign the tickets first |
+
+Every one of these is audited under `entityType=user`: `user.suspended`,
+`user.reactivated`, `user.invitation_revoked` and `user.deleted`.
+
+### Where somebody is signed in
+
+Suspending an account cuts off every device at once. When one device is the
+problem — a stolen laptop, a shared machine left logged in — the sessions of one
+account can be looked at and ended individually:
+
+```bash
+# perm user:manage. ip, userAgent, createdAt, lastUsedAt, expiresAt per session.
+curl localhost:3000/api/v1/users/$ID/sessions -H "authorization: Bearer $TOKEN"
+
+# ends that one session; the person's other devices stay signed in
+curl -X DELETE localhost:3000/api/v1/users/$ID/sessions/$SESSION_ID \
+  -H "authorization: Bearer $TOKEN"
+```
+
+Both are the administrator's view. `GET /api/v1/auth/sessions` is the same list
+for your own account, and needs no permission. Revocation is audited as
+`auth.session_revoked`, carrying the account it belonged to alongside the actor
+who ended it, and the session row itself records `revoked_by_admin`.
+
+### Reading the trail
+
+Two read-only logs, both behind `audit:read`.
+
+```bash
+# every state change in the system: who, what, before, after
+curl "localhost:3000/api/v1/audit-logs?entityType=user&actorId=$ID" \
+  -H "authorization: Bearer $TOKEN"
+
+# every authentication decision, successful or not
+curl "localhost:3000/api/v1/auth/login-attempts?userId=$ID" \
+  -H "authorization: Bearer $TOKEN"
+```
+
+`/audit-logs` filters on `entityType`, `entityId`, `actorId`, `action`, `from`
+and `to`. Rows are written in the same transaction as the change they describe,
+so the trail cannot disagree with the data, and there is no write surface at all
+— the retention sweep is the only thing that ever deletes one.
+
+`/auth/login-attempts` filters on `userId`, `email`, `outcome`, `from` and `to`.
+It is the forensic view: `password_failed`, `otp_expired`, `account_locked`,
+`sso_denied` and the rest. Filter by `email` rather than `userId` to see the rows
+that matched **no** account — a run of `unknown_email` from one address is an
+enumeration sweep, and is invisible from a per-account view.
+
+Both paginate by keyset on `createdAt` descending; pass the `nextCursor` from
+`meta.pagination` to continue.
+
 ### Through an identity provider
 
 Staff can also sign in through Google, Microsoft Entra or any OpenID Connect

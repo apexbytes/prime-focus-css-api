@@ -6,6 +6,7 @@ import {
   requireSelfOrPermission,
   requireUserActor,
 } from '../auth/auth.middleware.js';
+import { userSessionRouter } from '../auth/auth.routes.js';
 import { agentSkillRouter } from '../routing/routing.routes.js';
 import {
   changeAvailability,
@@ -13,6 +14,7 @@ import {
   changeOwnAvailability,
   changeRole,
   changeStatus,
+  deleteUser,
   getUser,
   listUsers,
   updateOwnProfile,
@@ -54,6 +56,16 @@ userRouter.patch(
   updateUser,
 );
 
+// Its own permission rather than `user:manage`: removing someone from the
+// roster is a different act from editing them, and follows `ticket:delete` in
+// being separable from the day-to-day management grant.
+userRouter.delete(
+  '/:id',
+  requirePermission('user:delete'),
+  validate({ params: userIdParams }),
+  deleteUser,
+);
+
 userRouter.patch(
   '/:id/role',
   requirePermission('user:manage'),
@@ -85,3 +97,7 @@ userRouter.patch(
 // Skills live with the routing module, which is what consumes them, but they
 // belong to a person so they are addressed under that person.
 userRouter.use('/:id/skills', agentSkillRouter);
+
+// Same arrangement for sessions: the auth module owns them, but "where is this
+// person signed in" is a question about the person.
+userRouter.use('/:id/sessions', userSessionRouter);

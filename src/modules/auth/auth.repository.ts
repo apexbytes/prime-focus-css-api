@@ -1,14 +1,16 @@
-import { and, desc, eq, gt, isNull } from 'drizzle-orm';
+import { and, desc, eq, gt, gte, isNull, lt, lte } from 'drizzle-orm';
 import { db } from '../../db/client.js';
 import type { Executor } from '../../db/transaction.js';
 import {
   loginAttempts,
   passwordResetTokens,
   sessions,
+  type LoginAttemptRow,
   type LoginOutcome,
   type PasswordResetTokenRow,
   type SessionRow,
 } from './auth.model.js';
+import type { LoginAttemptFilter } from './auth.types.js';
 
 // -- sessions -----------------------------------------------------------------
 
@@ -154,6 +156,33 @@ export async function consumeOutstandingResets(userId: string, exec: Executor = 
 }
 
 // -- login attempts -----------------------------------------------------------
+
+/**
+ * The investigator's read of the attempt log. Rows with no `userId` are kept
+ * deliberately — a run of `unknown_email` from one address is an enumeration
+ * sweep, and is invisible if the table is only ever queried per account.
+ */
+export function listAttempts(
+  filter: LoginAttemptFilter,
+  exec: Executor = db,
+): Promise<LoginAttemptRow[]> {
+  const conditions = [
+    filter.userId ? eq(loginAttempts.userId, filter.userId) : undefined,
+    filter.email ? eq(loginAttempts.email, filter.email) : undefined,
+    filter.outcome ? eq(loginAttempts.outcome, filter.outcome) : undefined,
+    filter.from ? gte(loginAttempts.createdAt, filter.from) : undefined,
+    filter.to ? lte(loginAttempts.createdAt, filter.to) : undefined,
+    // Keyset pagination on the same descending order as both indexes.
+    filter.cursor ? lt(loginAttempts.createdAt, new Date(filter.cursor)) : undefined,
+  ].filter((condition) => condition !== undefined);
+
+  return exec
+    .select()
+    .from(loginAttempts)
+    .where(conditions.length > 0 ? and(...conditions) : undefined)
+    .orderBy(desc(loginAttempts.createdAt))
+    .limit(filter.limit);
+}
 
 export async function recordAttempt(
   values: {

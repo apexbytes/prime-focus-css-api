@@ -276,6 +276,22 @@ export async function accept(input: {
 }
 
 /**
+ * Kills the live invitation of an account that is being deleted.
+ *
+ * Without it the emailed link would outlive the account it creates: `accept()`
+ * looks the invitation up by token, not by whether the user is still on the
+ * roster. Silent when there is nothing live — most deleted accounts were
+ * activated long ago.
+ */
+export async function revokeLiveForUser(userId: string, exec: Executor): Promise<void> {
+  const live = await repository.findLiveForUser(userId, exec);
+  if (!live) return;
+
+  await repository.revoke(live.id, exec);
+  log.info('invitation revoked with the account', { userId, invitationId: live.id });
+}
+
+/**
  * Closes off an invitation whose invitee signed in through an identity provider
  * instead of clicking the link.
  *

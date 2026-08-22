@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { env } from '../../config/index.js';
 import { getContext, setActor } from '../../common/context/request-context.js';
 import { AppError, ErrorCode } from '../../common/errors/index.js';
-import type { Actor, UserActor } from '../../common/types/actor.js';
+import { isUserActor, type Actor, type UserActor } from '../../common/types/actor.js';
 import { SUPER_ADMIN_ROLE_CODE, ALL_PERMISSION_CODES } from '../../common/types/permissions.js';
 import {
   burnPasswordVerify,
@@ -28,7 +28,14 @@ import * as roleService from '../role/role.service.js';
 import * as userService from '../user/user.service.js';
 import type { UserWithRole } from '../user/user.types.js';
 import * as repository from './auth.repository.js';
-import type { AuthenticatedResult, LoginResult, PublicSession, TokenPair } from './auth.types.js';
+import type {
+  AuthenticatedResult,
+  LoginAttemptFilter,
+  LoginResult,
+  PublicLoginAttempt,
+  PublicSession,
+  TokenPair,
+} from './auth.types.js';
 
 const log = createModuleLogger('auth');
 
@@ -521,9 +528,94 @@ export async function revokeSession(actor: UserActor, sessionId: string): Promis
 
   await repository.revokeSession(sessionId, 'user_signed_out');
   await auditService.recordSafely(
-    { action: 'auth.session_revoked', entityType: 'session', entityId: sessionId },
+    {
+      action: 'auth.session_revoked',
+      entityType: 'session',
+      entityId: sessionId,
+      before: { userId: actor.id },
+    },
     actor,
   );
+}
+
+// -- sessions, as an administrator sees them ----------------------------------
+
+/**
+ * Somebody else's live sessions.
+ *
+ * Suspending an account already cuts every one of them off, but that is the
+ * whole account. This is the narrower question — where is this person signed in,
+ * and can one stolen laptop be dealt with on its own.
+ */
+export async function listSessionsFor(userId: string, actor: Actor): Promise<PublicSession[]> {
+  await userService.requireById(userId);
+  const rows = await repository.listLiveSessions(userId);
+
+  return rows.map((row) => ({
+    id: row.id,
+    ip: row.ip,
+    userAgent: row.userAgent,
+    createdAt: row.createdAt,
+    lastUsedAt: row.lastUsedAt,
+    expiresAt: row.expiresAt,
+    // Meaningful only when an administrator is looking at their own account
+    // through this route; false for everybody else's.
+    current: isUserActor(actor) && row.id === actor.sessionId,
+  }));
+}
+
+/** Ends one of somebody else's sessions without touching the rest. */
+export async function revokeSessionFor(
+  userId: string,
+  sessionId: string,
+  actor: Actor,
+): Promise<void> {
+  await userService.requireById(userId);
+
+  // Checked against the user in the path, so naming one account and revoking
+  // another's session is not possible.
+  const session = await repository.findSessionById(sessionId);
+  if (!session || session.userId !== userId) throw AppError.notFound('Session not found');
+
+  await repository.revokeSession(sessionId, 'revoked_by_admin');
+  await auditService.recordSafely(
+    {
+      action: 'auth.session_revoked',
+      entityType: 'session',
+      entityId: sessionId,
+      // The subject, next to the actor the trail records anyway: the pair is
+      // what distinguishes an administrator ending a session from someone
+      // signing themselves out.
+      before: { userId, ip: session.ip, userAgent: session.userAgent },
+    },
+    actor,
+  );
+
+  log.info('session revoked by administrator', { userId, sessionId });
+}
+
+// -- login attempts -----------------------------------------------------------
+
+/**
+ * Reads the attempt log. Written on every authentication decision since Phase 2
+ * and, until now, never read back: the table exists to give an investigator the
+ * sequence of events behind a compromised account, which needs a way out.
+ */
+export async function listLoginAttempts(filter: LoginAttemptFilter): Promise<PublicLoginAttempt[]> {
+  const rows = await repository.listAttempts({
+    ...filter,
+    ...(filter.email ? { email: userService.normaliseEmail(filter.email) } : {}),
+  });
+
+  return rows.map((row) => ({
+    id: row.id,
+    email: row.email,
+    userId: row.userId,
+    outcome: row.outcome,
+    ip: row.ip,
+    userAgent: row.userAgent,
+    createdAt: row.createdAt,
+  }));
 }
 
 export async function logout(actor: UserActor): Promise<void> {
@@ -551,9 +643,17 @@ export async function logoutEverywhere(actor: UserActor): Promise<{ sessionsRevo
   return { sessionsRevoked };
 }
 
-/** Hook handed to the user module when an account is suspended. */
-export async function revokeAccess(userId: string, exec: Executor): Promise<void> {
-  await repository.revokeAllForUser(userId, 'account_suspended', exec);
+/**
+ * Hook handed to the user module when an account stops being usable. The reason
+ * lands on every revoked session, so suspension and deletion stay tellable apart
+ * when someone reads the session trail afterwards.
+ */
+export async function revokeAccess(
+  userId: string,
+  exec: Executor,
+  reason = 'account_suspended',
+): Promise<void> {
+  await repository.revokeAllForUser(userId, reason, exec);
   await mfaService.revokeAllDevices(userId, exec);
 }
 

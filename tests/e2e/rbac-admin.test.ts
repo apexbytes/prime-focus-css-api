@@ -4,7 +4,15 @@ import { createApp } from '../../src/app.js';
 import { closeDatabase, db } from '../../src/db/client.js';
 import { auditLogs } from '../../src/modules/audit/audit.model.js';
 import { resetDatabase } from '../helpers/db.js';
-import { bearer, createActiveUser, roleIdFor, signIn } from '../helpers/identity.js';
+import {
+  bearer,
+  createActiveUser,
+  grantProduct,
+  invitationTokenFor,
+  roleIdFor,
+  signIn,
+  STRONG_PASSWORD,
+} from '../helpers/identity.js';
 
 const enabled = process.env.RUN_DB_TESTS === '1';
 const app = createApp();
@@ -260,6 +268,197 @@ describe.runIf(enabled)('roles, permissions and administration', () => {
     });
   });
 
+  describe('deleting an account', () => {
+    it('removes the account from the roster and cuts off its access', async () => {
+      await request(app)
+        .delete(`/api/v1/users/${agentId}`)
+        .set(...bearer(adminToken))
+        .expect(204);
+
+      const roster = await request(app)
+        .get('/api/v1/users')
+        .set(...bearer(adminToken));
+      expect(roster.body.data.some((row: { id: string }) => row.id === agentId)).toBe(false);
+
+      await request(app)
+        .get(`/api/v1/users/${agentId}`)
+        .set(...bearer(adminToken))
+        .expect(404);
+
+      // The tokens they were already holding stop working, and they cannot get
+      // new ones.
+      const me = await request(app)
+        .get('/api/v1/auth/me')
+        .set(...bearer(agentToken));
+      expect(me.status).toBeGreaterThanOrEqual(401);
+
+      const login = await request(app)
+        .post('/api/v1/auth/login')
+        .send({ email: AGENT_EMAIL, password: STRONG_PASSWORD });
+      expect(login.status).toBeGreaterThanOrEqual(400);
+    });
+
+    it('records the deletion in the audit trail, keeping the real email', async () => {
+      await request(app)
+        .delete(`/api/v1/users/${agentId}`)
+        .set(...bearer(adminToken))
+        .expect(204);
+
+      const response = await request(app)
+        .get('/api/v1/audit-logs?action=user.deleted')
+        .set(...bearer(superToken));
+
+      expect(response.status).toBe(200);
+      const [entry] = response.body.data;
+      expect(entry.entityType).toBe('user');
+      expect(entry.entityId).toBe(agentId);
+      expect(entry.actorLabel).toBe(ADMIN_EMAIL);
+      // The row's own email is tombstoned by the delete, so the trail is the
+      // only place the address survives.
+      expect(entry.before).toMatchObject({
+        email: AGENT_EMAIL,
+        fullName: 'Agent',
+        status: 'active',
+        roleCode: 'tier1_agent',
+      });
+      expect(entry.after).toEqual({ deleted: true });
+    });
+
+    it('refuses to delete your own account', async () => {
+      const me = await request(app)
+        .get('/api/v1/auth/me')
+        .set(...bearer(adminToken));
+
+      const response = await request(app)
+        .delete(`/api/v1/users/${me.body.data.id}`)
+        .set(...bearer(adminToken));
+
+      expect(response.status).toBe(409);
+      expect(response.body.error.code).toBe('SELF_ACTION_FORBIDDEN');
+    });
+
+    it('refuses to delete the last super administrator', async () => {
+      const users = await request(app)
+        .get('/api/v1/users')
+        .set(...bearer(superToken));
+      const root = users.body.data.find((row: { email: string }) => row.email === SUPER_EMAIL) as {
+        id: string;
+      };
+
+      const response = await request(app)
+        .delete(`/api/v1/users/${root.id}`)
+        .set(...bearer(adminToken));
+
+      expect(response.status).toBe(409);
+      expect(response.body.error.code).toBe('LAST_SUPER_ADMIN');
+    });
+
+    it('refuses while the account still holds open tickets', async () => {
+      const productId = await grantProduct(agentId, 'pf_wallet');
+      const ticket = await request(app)
+        .post('/api/v1/tickets')
+        .set(...bearer(agentToken))
+        .send({
+          productId,
+          subject: 'Transfer failed',
+          body: 'Money left my wallet and never arrived.',
+          customerEmail: 'tendai@example.co.zw',
+          customerName: 'Tendai Moyo',
+        })
+        .expect(201);
+
+      await request(app)
+        .post(`/api/v1/tickets/${ticket.body.data.id}/assign`)
+        .set(...bearer(adminToken))
+        .send({ assignedToUserId: agentId })
+        .expect(200);
+
+      const response = await request(app)
+        .delete(`/api/v1/users/${agentId}`)
+        .set(...bearer(adminToken));
+
+      expect(response.status).toBe(409);
+      expect(response.body.error.code).toBe('USER_HAS_OPEN_TICKETS');
+
+      // Hand the work over and the delete goes through.
+      await request(app)
+        .post(`/api/v1/tickets/${ticket.body.data.id}/assign`)
+        .set(...bearer(adminToken))
+        .send({ assignedToUserId: null })
+        .expect(200);
+
+      await request(app)
+        .delete(`/api/v1/users/${agentId}`)
+        .set(...bearer(adminToken))
+        .expect(204);
+    });
+
+    it('needs user:delete, which reading and managing staff do not imply', async () => {
+      // tier2_specialist holds user:read but neither user:manage nor user:delete.
+      await createActiveUser({
+        email: 'tier2@primefocus.co.zw',
+        roleCode: 'tier2_specialist',
+        fullName: 'Tier Two',
+      });
+      const tier2Token = (await signIn(app, 'tier2@primefocus.co.zw')).accessToken;
+
+      const response = await request(app)
+        .delete(`/api/v1/users/${agentId}`)
+        .set(...bearer(tier2Token));
+
+      expect(response.status).toBe(403);
+    });
+
+    it('kills the invitation link of an account deleted before it was accepted', async () => {
+      await request(app)
+        .post('/api/v1/invitations')
+        .set(...bearer(adminToken))
+        .send({
+          email: 'pending@primefocus.co.zw',
+          fullName: 'Pending Person',
+          roleId: await roleIdFor('tier1_agent'),
+        })
+        .expect(201);
+
+      const token = invitationTokenFor('pending@primefocus.co.zw');
+      const roster = await request(app)
+        .get('/api/v1/users?status=invited')
+        .set(...bearer(adminToken));
+      const pending = roster.body.data.find(
+        (row: { email: string }) => row.email === 'pending@primefocus.co.zw',
+      ) as { id: string };
+
+      await request(app)
+        .delete(`/api/v1/users/${pending.id}`)
+        .set(...bearer(adminToken))
+        .expect(204);
+
+      // The emailed link must not outlive the account it would have created.
+      const accepted = await request(app)
+        .post('/api/v1/invitations/accept')
+        .send({ token, password: STRONG_PASSWORD });
+      expect(accepted.status).toBeGreaterThanOrEqual(400);
+    });
+
+    it('frees the email address for a fresh invitation', async () => {
+      await request(app)
+        .delete(`/api/v1/users/${agentId}`)
+        .set(...bearer(adminToken))
+        .expect(204);
+
+      const response = await request(app)
+        .post('/api/v1/invitations')
+        .set(...bearer(adminToken))
+        .send({
+          email: AGENT_EMAIL,
+          fullName: 'Agent Again',
+          roleId: await roleIdFor('tier1_agent'),
+        });
+
+      expect(response.status).toBe(201);
+    });
+  });
+
   describe('profiles', () => {
     it('lets an agent edit their own details without user:manage', async () => {
       const response = await request(app)
@@ -373,6 +572,179 @@ describe.runIf(enabled)('roles, permissions and administration', () => {
         .post('/api/v1/api-keys')
         .set('x-api-key', created.body.data.key as string)
         .send({ name: 'Child key', scopes: ['ticket:read'] });
+
+      expect(response.status).toBe(403);
+    });
+  });
+
+  describe('sessions, seen by an administrator', () => {
+    const VICTIM = 'twodevices@primefocus.co.zw';
+    let victimId: string;
+    let laptop: string;
+    let phone: string;
+
+    beforeEach(async () => {
+      const victim = await createActiveUser({
+        email: VICTIM,
+        roleCode: 'tier1_agent',
+        fullName: 'Two Devices',
+      });
+      victimId = victim.id;
+      laptop = (await signIn(app, VICTIM)).accessToken;
+      phone = (await signIn(app, VICTIM)).accessToken;
+    });
+
+    /** The listing is the only place a session id is exposed, by design. */
+    async function sessionIdsOf(userId: string): Promise<string[]> {
+      const response = await request(app)
+        .get(`/api/v1/users/${userId}/sessions`)
+        .set(...bearer(adminToken));
+      return response.body.data.map((row: { id: string }) => row.id);
+    }
+
+    it('lists where somebody else is signed in', async () => {
+      const response = await request(app)
+        .get(`/api/v1/users/${victimId}/sessions`)
+        .set(...bearer(adminToken));
+
+      expect(response.status).toBe(200);
+      expect(response.body.data).toHaveLength(2);
+      expect(response.body.data[0]).toMatchObject({ current: false });
+      expect(response.body.data[0].lastUsedAt).toBeTypeOf('string');
+    });
+
+    it('ends one device without touching the other', async () => {
+      const [target] = await sessionIdsOf(victimId);
+
+      await request(app)
+        .delete(`/api/v1/users/${victimId}/sessions/${target}`)
+        .set(...bearer(adminToken))
+        .expect(204);
+
+      // Exactly one of the two devices is cut off. Which one is not the point —
+      // that the other survives is, because suspending the account would have
+      // taken both.
+      const outcomes = await Promise.all(
+        [laptop, phone].map((token) =>
+          request(app)
+            .get('/api/v1/auth/me')
+            .set(...bearer(token)),
+        ),
+      );
+
+      expect(outcomes.map((response) => response.status).sort()).toEqual([200, 401]);
+      const dead = outcomes.find((response) => response.status === 401);
+      expect(dead?.body.error.code).toBe('SESSION_REVOKED');
+
+      expect(await sessionIdsOf(victimId)).toHaveLength(1);
+    });
+
+    it('refuses a session id that belongs to a different account', async () => {
+      const me = await request(app)
+        .get('/api/v1/auth/me')
+        .set(...bearer(adminToken));
+      const [mine] = await sessionIdsOf(me.body.data.id as string);
+
+      // Naming one account and revoking another's session must not work.
+      const response = await request(app)
+        .delete(`/api/v1/users/${victimId}/sessions/${mine}`)
+        .set(...bearer(adminToken));
+
+      expect(response.status).toBe(404);
+    });
+
+    it('needs user:manage, not just a signed-in account', async () => {
+      const [target] = await sessionIdsOf(victimId);
+
+      await request(app)
+        .get(`/api/v1/users/${victimId}/sessions`)
+        .set(...bearer(agentToken))
+        .expect(403);
+
+      await request(app)
+        .delete(`/api/v1/users/${victimId}/sessions/${target}`)
+        .set(...bearer(agentToken))
+        .expect(403);
+    });
+
+    it('records the revocation against the account it belonged to', async () => {
+      const [target] = await sessionIdsOf(victimId);
+      await request(app)
+        .delete(`/api/v1/users/${victimId}/sessions/${target}`)
+        .set(...bearer(adminToken))
+        .expect(204);
+
+      const response = await request(app)
+        .get('/api/v1/audit-logs?action=auth.session_revoked')
+        .set(...bearer(superToken));
+
+      const [entry] = response.body.data;
+      expect(entry.entityType).toBe('session');
+      expect(entry.entityId).toBe(target);
+      // Actor is the administrator, subject is the account: the pair is what
+      // separates this from somebody signing themselves out.
+      expect(entry.actorLabel).toBe(ADMIN_EMAIL);
+      expect(entry.before).toMatchObject({ userId: victimId });
+    });
+  });
+
+  describe('the login attempt log', () => {
+    it('reads back both the failed and the successful attempts on an account', async () => {
+      await request(app)
+        .post('/api/v1/auth/login')
+        .send({ email: AGENT_EMAIL, password: 'not-the-right-password' });
+
+      const response = await request(app)
+        .get(`/api/v1/auth/login-attempts?userId=${agentId}`)
+        .set(...bearer(adminToken));
+
+      expect(response.status).toBe(200);
+      const outcomes = response.body.data.map((row: { outcome: string }) => row.outcome);
+      // The sign-in in beforeEach left the successes behind.
+      expect(outcomes).toContain('password_failed');
+      expect(outcomes).toContain('password_ok');
+      expect(outcomes).toContain('otp_ok');
+      expect(response.body.meta.pagination.limit).toBe(25);
+    });
+
+    it('surfaces attempts that matched no account at all', async () => {
+      await request(app)
+        .post('/api/v1/auth/login')
+        .send({ email: 'ghost@primefocus.co.zw', password: STRONG_PASSWORD });
+
+      const response = await request(app)
+        .get('/api/v1/auth/login-attempts?outcome=unknown_email')
+        .set(...bearer(adminToken));
+
+      expect(response.status).toBe(200);
+      expect(response.body.data).toHaveLength(1);
+      // No user to hang it off, which is exactly why a per-account view would
+      // never have shown it.
+      expect(response.body.data[0]).toMatchObject({
+        email: 'ghost@primefocus.co.zw',
+        userId: null,
+        outcome: 'unknown_email',
+      });
+      expect(response.body.data[0].ip).toBeTypeOf('string');
+    });
+
+    it('filters by email, including one that never matched', async () => {
+      await request(app)
+        .post('/api/v1/auth/login')
+        .send({ email: 'GHOST@primefocus.co.zw', password: STRONG_PASSWORD });
+
+      const response = await request(app)
+        .get('/api/v1/auth/login-attempts?email=ghost@primefocus.co.zw')
+        .set(...bearer(adminToken));
+
+      expect(response.status).toBe(200);
+      expect(response.body.data).toHaveLength(1);
+    });
+
+    it('needs audit:read', async () => {
+      const response = await request(app)
+        .get('/api/v1/auth/login-attempts')
+        .set(...bearer(agentToken));
 
       expect(response.status).toBe(403);
     });

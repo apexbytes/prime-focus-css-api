@@ -13,6 +13,7 @@ export const PERMISSION_CATALOGUE = [
   { code: 'user:read', description: 'View staff accounts', category: 'users' },
   { code: 'user:invite', description: 'Invite new staff members', category: 'users' },
   { code: 'user:manage', description: 'Change staff roles, details and status', category: 'users' },
+  { code: 'user:delete', description: 'Delete staff accounts', category: 'users' },
   // roles
   { code: 'role:read', description: 'View roles and permissions', category: 'roles' },
   {
@@ -173,6 +174,7 @@ export const SYSTEM_ROLES: readonly SystemRoleDefinition[] = [
       'user:read',
       'user:invite',
       'user:manage',
+      'user:delete',
       'role:read',
       'team:read',
       'team:manage',
