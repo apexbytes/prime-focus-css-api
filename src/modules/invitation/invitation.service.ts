@@ -2,7 +2,7 @@ import { env } from '../../config/index.js';
 import { AppError, ErrorCode } from '../../common/errors/index.js';
 import { isUserActor, type Actor } from '../../common/types/actor.js';
 import { generateSecret, hashPassword, hashSecret } from '../../common/utils/crypto.js';
-import { withTransaction } from '../../db/transaction.js';
+import { withTransaction, type Executor } from '../../db/transaction.js';
 import { createModuleLogger } from '../../lib/logger/index.js';
 import { invitationEmail, sendEmail, webUrl } from '../../lib/resend/index.js';
 import * as auditService from '../audit/audit.service.js';
@@ -273,6 +273,23 @@ export async function accept(input: {
 
   log.info('invitation accepted', { userId: user.id });
   return authService.startSessionForActivatedUser(user.id);
+}
+
+/**
+ * Closes off an invitation whose invitee signed in through an identity provider
+ * instead of clicking the link.
+ *
+ * Without this the link would stay live for its full 72 hours after the account
+ * is already active — a credential in an inbox that nobody expects to still
+ * work. Silent when there is no live invitation: an account can be linked to a
+ * provider long after it was activated the ordinary way.
+ */
+export async function markAcceptedByFederation(userId: string, exec: Executor): Promise<void> {
+  const live = await repository.findLiveForUser(userId, exec);
+  if (!live) return;
+
+  await repository.markAccepted(live.id, exec);
+  log.info('invitation closed by federated sign-in', { userId, invitationId: live.id });
 }
 
 async function requireUsable(token: string): Promise<InvitationWithDetails> {

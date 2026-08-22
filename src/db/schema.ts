@@ -49,3 +49,6 @@ export * from '../modules/report/report.model.js';
 // -- phase 6: realtime & scale ------------------------------------------------
 export * from '../modules/realtime/realtime.model.js';
 export * from '../modules/webhook/webhook.model.js';
+
+// -- phase 7: federation ------------------------------------------------------
+export * from '../modules/sso/sso.model.js';

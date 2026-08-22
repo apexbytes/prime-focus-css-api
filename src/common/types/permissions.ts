@@ -106,6 +106,18 @@ export const PERMISSION_CATALOGUE = [
     description: 'Create and delete outbound webhook subscriptions, and redeliver events to them',
     category: 'webhooks',
   },
+  // federated sign-in (Phase 7)
+  {
+    code: 'sso:read',
+    description: 'View configured identity providers and who is linked to them',
+    category: 'sso',
+  },
+  {
+    code: 'sso:manage',
+    description:
+      'Configure identity providers: which staff email domains may sign in through them, and with what client credentials',
+    category: 'sso',
+  },
   // retention (Phase 5)
   {
     code: 'retention:run',
@@ -176,6 +188,10 @@ export const SYSTEM_ROLES: readonly SystemRoleDefinition[] = [
       // an egress of ticket data to a host of the holder's choosing.
       'webhook:read',
       'webhook:manage',
+      // Same class again: a provider is a decision about who may become a
+      // signed-in member of staff.
+      'sso:read',
+      'sso:manage',
     ],
   },
   {

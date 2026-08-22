@@ -14,6 +14,9 @@ import { invalidateCalendarCache } from '../../src/modules/sla/sla.service.js';
  */
 const TABLES = [
   'audit_logs',
+  'sso_login_requests',
+  'sso_identities',
+  'identity_providers',
   'webhook_deliveries',
   'webhook_subscriptions',
   'ticket_locks',

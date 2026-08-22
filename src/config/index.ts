@@ -6,6 +6,7 @@ export {
   corsOrigins,
   emailTransport,
   queueDriver,
+  ssoRedirectUrl,
   storageBackend,
   antivirusDriver,
   isDevelopment,
