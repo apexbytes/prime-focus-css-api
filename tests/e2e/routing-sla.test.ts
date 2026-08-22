@@ -17,6 +17,7 @@ import {
   productIdFor,
   signIn,
 } from '../helpers/identity.js';
+import { openEveryDay } from '../helpers/calendar.js';
 
 /**
  * Phase 4 end to end: a ticket arrives, gets a deadline and an owner without
@@ -192,6 +193,9 @@ describe.runIf(enabled)('routing, SLA and escalation', () => {
     });
 
     it('pauses the clock while waiting on the customer, and pushes the deadline on resume', async () => {
+      // This case measures working time given back, so the clock has to be
+      // running today — see the note on `openEveryDay`.
+      await openEveryDay();
       const ticket = await createTicket();
 
       const before = (await slaFor(ticket.id)).body.data.targets.find(
@@ -419,6 +423,9 @@ describe.runIf(enabled)('routing, SLA and escalation', () => {
     }
 
     it('records a breach once, however often the scan runs', async () => {
+      // `minutesOverdue` is working minutes, so this asserts nothing on a day
+      // the calendar is closed — see the note on `openEveryDay`.
+      await openEveryDay();
       const ticket = await createTicket();
       await overdue(ticket.id);
 
