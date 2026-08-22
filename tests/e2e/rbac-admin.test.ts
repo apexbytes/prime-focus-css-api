@@ -577,6 +577,179 @@ describe.runIf(enabled)('roles, permissions and administration', () => {
     });
   });
 
+  describe('sessions, seen by an administrator', () => {
+    const VICTIM = 'twodevices@primefocus.co.zw';
+    let victimId: string;
+    let laptop: string;
+    let phone: string;
+
+    beforeEach(async () => {
+      const victim = await createActiveUser({
+        email: VICTIM,
+        roleCode: 'tier1_agent',
+        fullName: 'Two Devices',
+      });
+      victimId = victim.id;
+      laptop = (await signIn(app, VICTIM)).accessToken;
+      phone = (await signIn(app, VICTIM)).accessToken;
+    });
+
+    /** The listing is the only place a session id is exposed, by design. */
+    async function sessionIdsOf(userId: string): Promise<string[]> {
+      const response = await request(app)
+        .get(`/api/v1/users/${userId}/sessions`)
+        .set(...bearer(adminToken));
+      return response.body.data.map((row: { id: string }) => row.id);
+    }
+
+    it('lists where somebody else is signed in', async () => {
+      const response = await request(app)
+        .get(`/api/v1/users/${victimId}/sessions`)
+        .set(...bearer(adminToken));
+
+      expect(response.status).toBe(200);
+      expect(response.body.data).toHaveLength(2);
+      expect(response.body.data[0]).toMatchObject({ current: false });
+      expect(response.body.data[0].lastUsedAt).toBeTypeOf('string');
+    });
+
+    it('ends one device without touching the other', async () => {
+      const [target] = await sessionIdsOf(victimId);
+
+      await request(app)
+        .delete(`/api/v1/users/${victimId}/sessions/${target}`)
+        .set(...bearer(adminToken))
+        .expect(204);
+
+      // Exactly one of the two devices is cut off. Which one is not the point —
+      // that the other survives is, because suspending the account would have
+      // taken both.
+      const outcomes = await Promise.all(
+        [laptop, phone].map((token) =>
+          request(app)
+            .get('/api/v1/auth/me')
+            .set(...bearer(token)),
+        ),
+      );
+
+      expect(outcomes.map((response) => response.status).sort()).toEqual([200, 401]);
+      const dead = outcomes.find((response) => response.status === 401);
+      expect(dead?.body.error.code).toBe('SESSION_REVOKED');
+
+      expect(await sessionIdsOf(victimId)).toHaveLength(1);
+    });
+
+    it('refuses a session id that belongs to a different account', async () => {
+      const me = await request(app)
+        .get('/api/v1/auth/me')
+        .set(...bearer(adminToken));
+      const [mine] = await sessionIdsOf(me.body.data.id as string);
+
+      // Naming one account and revoking another's session must not work.
+      const response = await request(app)
+        .delete(`/api/v1/users/${victimId}/sessions/${mine}`)
+        .set(...bearer(adminToken));
+
+      expect(response.status).toBe(404);
+    });
+
+    it('needs user:manage, not just a signed-in account', async () => {
+      const [target] = await sessionIdsOf(victimId);
+
+      await request(app)
+        .get(`/api/v1/users/${victimId}/sessions`)
+        .set(...bearer(agentToken))
+        .expect(403);
+
+      await request(app)
+        .delete(`/api/v1/users/${victimId}/sessions/${target}`)
+        .set(...bearer(agentToken))
+        .expect(403);
+    });
+
+    it('records the revocation against the account it belonged to', async () => {
+      const [target] = await sessionIdsOf(victimId);
+      await request(app)
+        .delete(`/api/v1/users/${victimId}/sessions/${target}`)
+        .set(...bearer(adminToken))
+        .expect(204);
+
+      const response = await request(app)
+        .get('/api/v1/audit-logs?action=auth.session_revoked')
+        .set(...bearer(superToken));
+
+      const [entry] = response.body.data;
+      expect(entry.entityType).toBe('session');
+      expect(entry.entityId).toBe(target);
+      // Actor is the administrator, subject is the account: the pair is what
+      // separates this from somebody signing themselves out.
+      expect(entry.actorLabel).toBe(ADMIN_EMAIL);
+      expect(entry.before).toMatchObject({ userId: victimId });
+    });
+  });
+
+  describe('the login attempt log', () => {
+    it('reads back both the failed and the successful attempts on an account', async () => {
+      await request(app)
+        .post('/api/v1/auth/login')
+        .send({ email: AGENT_EMAIL, password: 'not-the-right-password' });
+
+      const response = await request(app)
+        .get(`/api/v1/auth/login-attempts?userId=${agentId}`)
+        .set(...bearer(adminToken));
+
+      expect(response.status).toBe(200);
+      const outcomes = response.body.data.map((row: { outcome: string }) => row.outcome);
+      // The sign-in in beforeEach left the successes behind.
+      expect(outcomes).toContain('password_failed');
+      expect(outcomes).toContain('password_ok');
+      expect(outcomes).toContain('otp_ok');
+      expect(response.body.meta.pagination.limit).toBe(25);
+    });
+
+    it('surfaces attempts that matched no account at all', async () => {
+      await request(app)
+        .post('/api/v1/auth/login')
+        .send({ email: 'ghost@primefocus.co.zw', password: STRONG_PASSWORD });
+
+      const response = await request(app)
+        .get('/api/v1/auth/login-attempts?outcome=unknown_email')
+        .set(...bearer(adminToken));
+
+      expect(response.status).toBe(200);
+      expect(response.body.data).toHaveLength(1);
+      // No user to hang it off, which is exactly why a per-account view would
+      // never have shown it.
+      expect(response.body.data[0]).toMatchObject({
+        email: 'ghost@primefocus.co.zw',
+        userId: null,
+        outcome: 'unknown_email',
+      });
+      expect(response.body.data[0].ip).toBeTypeOf('string');
+    });
+
+    it('filters by email, including one that never matched', async () => {
+      await request(app)
+        .post('/api/v1/auth/login')
+        .send({ email: 'GHOST@primefocus.co.zw', password: STRONG_PASSWORD });
+
+      const response = await request(app)
+        .get('/api/v1/auth/login-attempts?email=ghost@primefocus.co.zw')
+        .set(...bearer(adminToken));
+
+      expect(response.status).toBe(200);
+      expect(response.body.data).toHaveLength(1);
+    });
+
+    it('needs audit:read', async () => {
+      const response = await request(app)
+        .get('/api/v1/auth/login-attempts')
+        .set(...bearer(agentToken));
+
+      expect(response.status).toBe(403);
+    });
+  });
+
   describe('audit trail', () => {
     it('records administrative changes with the acting user', async () => {
       await request(app)

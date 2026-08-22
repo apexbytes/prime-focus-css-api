@@ -6,6 +6,7 @@ import {
   requireSelfOrPermission,
   requireUserActor,
 } from '../auth/auth.middleware.js';
+import { userSessionRouter } from '../auth/auth.routes.js';
 import { agentSkillRouter } from '../routing/routing.routes.js';
 import {
   changeAvailability,
@@ -96,3 +97,7 @@ userRouter.patch(
 // Skills live with the routing module, which is what consumes them, but they
 // belong to a person so they are addressed under that person.
 userRouter.use('/:id/skills', agentSkillRouter);
+
+// Same arrangement for sessions: the auth module owns them, but "where is this
+// person signed in" is a question about the person.
+userRouter.use('/:id/sessions', userSessionRouter);

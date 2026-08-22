@@ -64,6 +64,13 @@
       "when": 1787387010396,
       "tag": "0008_whatsapp_media",
       "breakpoints": true
+    },
+    {
+      "idx": 9,
+      "version": "7",
+      "when": 1787392729695,
+      "tag": "0009_admin_security_reads",
+      "breakpoints": true
     }
   ]
 }

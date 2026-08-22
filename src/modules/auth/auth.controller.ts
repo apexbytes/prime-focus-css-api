@@ -1,17 +1,23 @@
 import type { Request, Response } from 'express';
 import { AppError } from '../../common/errors/index.js';
-import type { UserActor } from '../../common/types/actor.js';
+import type { Actor, UserActor } from '../../common/types/actor.js';
 import { sendNoContent, sendSuccess } from '../../common/utils/response.js';
 import * as authService from './auth.service.js';
 import type {
   ChangePasswordBody,
   ForgotPasswordBody,
+  ListLoginAttemptsQuery,
   LoginBody,
   RefreshBody,
   ResendOtpBody,
   ResetPasswordBody,
   VerifyOtpBody,
 } from './auth.schema.js';
+
+function actorOf(req: Request): Actor {
+  if (!req.actor) throw AppError.unauthenticated();
+  return req.actor;
+}
 
 /** requireUserActor guarantees this; the helper keeps handlers readable. */
 function userActor(req: Request): UserActor {
@@ -61,6 +67,38 @@ export async function listSessions(req: Request, res: Response): Promise<void> {
 export async function revokeSession(req: Request, res: Response): Promise<void> {
   await authService.revokeSession(userActor(req), req.params.id as string);
   sendNoContent(res);
+}
+
+// -- mounted under /users/:id ------------------------------------------------
+
+export async function listUserSessions(req: Request, res: Response): Promise<void> {
+  sendSuccess(res, await authService.listSessionsFor(req.params.id as string, actorOf(req)));
+}
+
+export async function revokeUserSession(req: Request, res: Response): Promise<void> {
+  await authService.revokeSessionFor(
+    req.params.id as string,
+    req.params.sessionId as string,
+    actorOf(req),
+  );
+  sendNoContent(res);
+}
+
+export async function listLoginAttempts(req: Request, res: Response): Promise<void> {
+  const query = req.query as unknown as ListLoginAttemptsQuery;
+
+  // One extra row tells us whether another page exists without a count query.
+  const rows = await authService.listLoginAttempts({ ...query, limit: query.limit + 1 });
+  const hasMore = rows.length > query.limit;
+  const items = hasMore ? rows.slice(0, query.limit) : rows;
+
+  sendSuccess(res, items, {
+    pagination: {
+      limit: query.limit,
+      hasMore,
+      nextCursor: hasMore ? (items.at(-1)?.createdAt.toISOString() ?? null) : null,
+    },
+  });
 }
 
 export async function forgotPassword(req: Request, res: Response): Promise<void> {

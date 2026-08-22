@@ -1,5 +1,5 @@
 import type { PublicUser } from '../user/user.types.js';
-import type { LoginOutcome, SessionRow } from './auth.model.js';
+import type { LoginAttemptRow, LoginOutcome, SessionRow } from './auth.model.js';
 
 export interface TokenPair {
   accessToken: string;
@@ -40,4 +40,28 @@ export interface PublicSession {
   current: boolean;
 }
 
-export type { LoginOutcome, SessionRow };
+export interface LoginAttemptFilter {
+  userId?: string;
+  email?: string;
+  outcome?: LoginOutcome;
+  from?: Date;
+  to?: Date;
+  limit: number;
+  cursor?: string;
+}
+
+/**
+ * One authentication decision. `userId` is null when nothing matched the address,
+ * which is the case worth looking at rather than the one worth hiding.
+ */
+export interface PublicLoginAttempt {
+  id: string;
+  email: string;
+  userId: string | null;
+  outcome: LoginOutcome;
+  ip: string | null;
+  userAgent: string | null;
+  createdAt: Date;
+}
+
+export type { LoginAttemptRow, LoginOutcome, SessionRow };

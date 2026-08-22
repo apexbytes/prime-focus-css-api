@@ -1,5 +1,6 @@
 import { z } from 'zod';
-import { env } from '../../config/index.js';
+import { DEFAULT_PAGE_SIZE, env, MAX_PAGE_SIZE } from '../../config/index.js';
+import { loginOutcome } from './auth.model.js';
 
 /** Emails are normalised here so every layer below sees one canonical form. */
 const email = z.string().trim().toLowerCase().pipe(z.email()).pipe(z.string().max(255));
@@ -49,6 +50,21 @@ export const changePasswordBody = z.object({
 
 export const sessionIdParams = z.object({ id: z.uuid() });
 
+/** For the routes mounted under /users/:id/sessions. */
+export const userIdParams = z.object({ id: z.uuid() });
+export const userSessionParams = z.object({ id: z.uuid(), sessionId: z.uuid() });
+
+export const listLoginAttemptsQuery = z.object({
+  userId: z.uuid().optional(),
+  /** Free text, not `email`: the interesting rows are the ones that matched no account. */
+  email: z.string().trim().toLowerCase().min(1).max(255).optional(),
+  outcome: z.enum(loginOutcome.enumValues).optional(),
+  from: z.coerce.date().optional(),
+  to: z.coerce.date().optional(),
+  cursor: z.string().min(1).optional(),
+  limit: z.coerce.number().int().min(1).max(MAX_PAGE_SIZE).default(DEFAULT_PAGE_SIZE),
+});
+
 export type LoginBody = z.infer<typeof loginBody>;
 export type VerifyOtpBody = z.infer<typeof verifyOtpBody>;
 export type ResendOtpBody = z.infer<typeof resendOtpBody>;
@@ -56,3 +72,4 @@ export type RefreshBody = z.infer<typeof refreshBody>;
 export type ForgotPasswordBody = z.infer<typeof forgotPasswordBody>;
 export type ResetPasswordBody = z.infer<typeof resetPasswordBody>;
 export type ChangePasswordBody = z.infer<typeof changePasswordBody>;
+export type ListLoginAttemptsQuery = z.infer<typeof listLoginAttemptsQuery>;

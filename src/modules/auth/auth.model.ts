@@ -92,10 +92,14 @@ export const loginAttempts = pgTable(
   },
   (table) => [
     index('login_attempts_email_created_idx').on(table.email, table.createdAt.desc()),
-    index('login_attempts_user_idx').on(table.userId),
+    // Ordered, because the investigator's read of this table is one account's
+    // attempts newest-first; the email twin above serves the same read for
+    // attempts that matched no account at all.
+    index('login_attempts_user_created_idx').on(table.userId, table.createdAt.desc()),
   ],
 );
 
 export type SessionRow = typeof sessions.$inferSelect;
 export type PasswordResetTokenRow = typeof passwordResetTokens.$inferSelect;
+export type LoginAttemptRow = typeof loginAttempts.$inferSelect;
 export type LoginOutcome = (typeof loginOutcome.enumValues)[number];
