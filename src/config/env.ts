@@ -294,6 +294,88 @@ export const envSchema = z.object({
    */
   WEBHOOK_DELIVERY_RETENTION_DAYS: z.coerce.number().int().min(1).max(365).default(30),
 
+  // ---- omnichannel: WhatsApp ------------------------------------------------
+  /**
+   * Meta app secret. It keys the `X-Hub-Signature-256` on every inbound
+   * webhook, and without it the ingress refuses everything: an unauthenticated
+   * inbound endpoint is a way to post messages to the desk as any phone number,
+   * which is impersonating a customer.
+   */
+  WHATSAPP_APP_SECRET: z.string().min(1).optional(),
+  /**
+   * The number messages are sent from, as Meta's own id for it rather than the
+   * number itself. A business can move its number between Cloud API numbers and
+   * the id is what the send endpoint is addressed by.
+   */
+  WHATSAPP_PHONE_NUMBER_ID: z.string().min(1).optional(),
+  /** System-user token for the Cloud API. Long-lived, and a secret. */
+  WHATSAPP_ACCESS_TOKEN: z.string().min(1).optional(),
+  /**
+   * The string Meta echoes back when it verifies the webhook URL. Meta sends it
+   * in a query parameter on a `GET`, which is why it is a value of its own and
+   * not the app secret: it travels in a URL, and nothing that signs anything is
+   * allowed to do that.
+   */
+  WHATSAPP_VERIFY_TOKEN: z.string().min(1).optional(),
+  WHATSAPP_API_BASE_URL: z.string().min(1).default('https://graph.facebook.com'),
+  WHATSAPP_HTTP_TIMEOUT_MS: z.coerce.number().int().min(1_000).max(30_000).default(10_000),
+  /** `cloud` once credentials exist, otherwise `log`, which sends nothing. */
+  WHATSAPP_TRANSPORT: z.enum(['cloud', 'log']).optional(),
+  /**
+   * Which product a WhatsApp conversation belongs to, by code.
+   *
+   * One number serves the whole business, so unlike email — where the address
+   * written to identifies the product — there is nothing in an inbound WhatsApp
+   * message that says which product it is about. Routing rules and the agent
+   * sort it out afterwards; this is where it lands first. Falls back to
+   * `DEFAULT_PRODUCT_CODE`.
+   */
+  WHATSAPP_PRODUCT_CODE: z.string().min(1).optional(),
+  /**
+   * Meta's customer-service window, in hours. 24 is the platform's rule, not a
+   * preference — free-form replies outside it are refused by the provider — and
+   * it is configurable only so a change on Meta's side does not need a deploy.
+   */
+  WHATSAPP_SERVICE_WINDOW_HOURS: z.coerce.number().int().min(1).max(168).default(24),
+  /**
+   * The approved template used to re-open a conversation whose window has
+   * closed, and the language it is approved in. Unset means an agent replying
+   * outside the window is told the reply could not be delivered rather than a
+   * template being invented on their behalf.
+   */
+  WHATSAPP_REOPEN_TEMPLATE: z.string().min(1).optional(),
+  WHATSAPP_REOPEN_TEMPLATE_LANGUAGE: z.string().min(2).default('en'),
+
+  /**
+   * How long a channel thread may sit idle before its ticket pointer is
+   * dropped, so the next message opens new work instead of reopening something
+   * the desk finished. Seven days by default: long enough that a customer who
+   * replies after a weekend joins the same ticket, short enough that "I have
+   * another problem" next month is not filed as the old one.
+   */
+  CONVERSATION_IDLE_HOURS: z.coerce.number().int().min(1).max(8760).default(168),
+  CONVERSATION_SWEEP_CRON: z.string().min(1).default('20 * * * *'),
+
+  // ---- omnichannel: live chat ----------------------------------------------
+  /** Off refuses new chat sessions; existing tickets are unaffected. */
+  CHAT_ENABLED: booleanish.default(true),
+  /** Socket.IO namespace the visitor widget connects to. */
+  CHAT_NAMESPACE: z.string().min(1).default('/chat'),
+  /**
+   * How long a visitor's session token is good for. Long enough to survive a
+   * page reload mid-conversation, short enough that a token left in a shared
+   * browser is not a way back into somebody else's thread tomorrow.
+   */
+  CHAT_SESSION_TTL_MINUTES: z.coerce.number().int().min(5).max(1440).default(120),
+  /** Which product a chat lands in when the widget does not name one. */
+  CHAT_PRODUCT_CODE: z.string().min(1).optional(),
+  /**
+   * Messages one visitor may send per minute. A chat widget is unauthenticated
+   * by construction, so this is the only thing between a bored visitor and a
+   * thousand ticket messages.
+   */
+  CHAT_MESSAGE_RATE_PER_MINUTE: z.coerce.number().int().min(1).max(600).default(30),
+
   // ---- federated sign-in (SSO) ---------------------------------------------
   /**
    * Where the identity provider sends the browser back. It is the **console's**
@@ -412,6 +494,26 @@ const productionSchema = envSchema.superRefine((value, ctx) => {
     });
   }
 
+  // A WhatsApp ingress with no app secret accepts anything that reaches the
+  // URL. There is no `log` escape hatch for this one: the alternative to
+  // verifying is trusting the internet about who a customer is.
+  if (value.WHATSAPP_TRANSPORT !== 'log' && value.WHATSAPP_ACCESS_TOKEN) {
+    if (!value.WHATSAPP_APP_SECRET) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['WHATSAPP_APP_SECRET'],
+        message: 'is required in production to verify inbound WhatsApp webhooks',
+      });
+    }
+    if (!value.WHATSAPP_PHONE_NUMBER_ID) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['WHATSAPP_PHONE_NUMBER_ID'],
+        message: 'is required to send WhatsApp replies',
+      });
+    }
+  }
+
   if (value.CORS_ORIGINS.trim() === '*') {
     ctx.addIssue({
       code: 'custom',
@@ -489,6 +591,16 @@ export const storageBackend: 'local' | 's3' =
   (env.STORAGE_BUCKET && env.STORAGE_ACCESS_KEY_ID && env.STORAGE_SECRET_ACCESS_KEY
     ? 's3'
     : 'local');
+
+/**
+ * `cloud` once an access token and a phone number id exist, otherwise `log`,
+ * which records what it would have sent instead of sending it — the same
+ * bargain `EMAIL_TRANSPORT` makes, and what lets the whole omnichannel path be
+ * exercised without a Meta business account.
+ */
+export const whatsappTransport: 'cloud' | 'log' =
+  env.WHATSAPP_TRANSPORT ??
+  (env.WHATSAPP_ACCESS_TOKEN && env.WHATSAPP_PHONE_NUMBER_ID ? 'cloud' : 'log');
 
 /**
  * The console route the provider redirects back to, derived from `APP_WEB_URL`

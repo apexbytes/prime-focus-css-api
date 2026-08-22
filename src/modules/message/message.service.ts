@@ -5,8 +5,12 @@ import { isUserActor, type Actor } from '../../common/types/actor.js';
 import { withTransaction, type Executor } from '../../db/transaction.js';
 import { createModuleLogger } from '../../lib/logger/index.js';
 import * as auditService from '../audit/audit.service.js';
+// Cyclic with conversation.service by design: a public reply has to go out on
+// whichever channel the ticket arrived on, and the inbound pipeline of those
+// channels has to be able to write a message. Both export hoisted function
+// declarations and touch each other only inside function bodies.
+import * as conversationService from '../conversation/conversation.service.js';
 import * as customerService from '../customer/customer.service.js';
-import * as emailService from '../email/email.service.js';
 import * as eventService from '../event/event.service.js';
 import { DOMAIN_EVENT } from '../event/event.types.js';
 import * as notificationService from '../notification/notification.service.js';
@@ -56,10 +60,18 @@ export interface PostReplyInput {
 /**
  * An agent's reply or internal note.
  *
- * A `public` message is emailed to the customer; an `internal` one never leaves
+ * A `public` message goes out to the customer; an `internal` one never leaves
  * the system. That branch is the most consequential line in this module — an
  * internal note reaching a customer would be a serious breach — so the outbound
  * send is gated on visibility here and asserted by tests.
+ *
+ * Phase 8 changed what "goes out" means and deliberately did not touch the
+ * branch it hangs off. Until then this function called the email service
+ * directly, which made "reply to the customer" and "send an email" the same
+ * statement; now it hands the reply to `conversation.dispatchReply`, which picks
+ * the transport from the ticket's channel. The visibility test above is still
+ * the only thing standing between an internal note and a customer, and it is
+ * still in one place.
  */
 export async function postAgentMessage(
   input: PostReplyInput,
@@ -125,13 +137,32 @@ export async function postAgentMessage(
       await notifyMentions(input.body, ticket, actor, row);
 
       if (input.visibility === 'public') {
-        await emailService.sendTicketReply({
+        const dispatch = await conversationService.dispatchReply({
           ticket,
           message: row,
-          to: customer.email,
-          customerName: customer.fullName,
+          customer: { email: customer.email, fullName: customer.fullName },
           externalMessageId: externalMessageId ?? undefined,
         });
+
+        if (!dispatch.delivered) {
+          // The reply is in the thread either way — it is the record of what the
+          // agent said — but on WhatsApp a refused send looks identical to a
+          // delivered one from the console. So it is written into the thread as
+          // a system note, which is the only place an agent will actually see it.
+          log.warn('public reply was not delivered', {
+            ticketId: ticket.id,
+            messageId: row.id,
+            channel: dispatch.channel,
+            transport: dispatch.transport,
+          });
+
+          await recordSystemMessage({
+            ticketId: ticket.id,
+            body: `This reply could not be delivered over ${dispatch.channel}: ${
+              dispatch.reason ?? 'the provider refused it'
+            }`,
+          });
+        }
       }
     });
 
@@ -174,6 +205,24 @@ async function notifyMentions(
 async function mentionedUser(email: string): Promise<string | null> {
   const user = await userService.findByEmail(email);
   return user && user.status === 'active' ? user.id : null;
+}
+
+/**
+ * The public half of a thread, for the customer whose thread it is.
+ *
+ * No actor, for the same reason `recordCustomerMessage` has none: the caller is
+ * the customer, and this system has no actor type for one. What makes it safe is
+ * upstream — the live-chat session token authorises exactly one conversation,
+ * and the conversation names exactly one ticket — so the check that matters has
+ * already happened by the time a ticket id gets here.
+ *
+ * `includeInternal: false` is not a default being relied on. It is passed
+ * explicitly, because this is the one read in the system whose output goes
+ * straight to a member of the public, and an internal note reaching a customer
+ * is the worst outcome this module can produce.
+ */
+export function customerVisibleThread(ticketId: string, limit: number) {
+  return repository.listForTicket(ticketId, { includeInternal: false, limit }, undefined);
 }
 
 /**

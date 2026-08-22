@@ -50,6 +50,13 @@
       "when": 1787378637248,
       "tag": "0006_phase7_federation",
       "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "7",
+      "when": 1787382391233,
+      "tag": "0007_phase8_omnichannel",
+      "breakpoints": true
     }
   ]
 }

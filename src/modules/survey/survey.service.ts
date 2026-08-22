@@ -66,6 +66,18 @@ export async function dispatch(ticketId: string): Promise<DispatchResult> {
     return { status: 'skipped', reason: 'customer record is gone' };
   }
 
+  // Since Phase 8 a customer may have reached the desk over WhatsApp or the chat
+  // widget and have no address at all. The survey is an email with a tokenised
+  // link in it, and there is no address to send it to — so it is skipped, with a
+  // reason, rather than mailed at a placeholder nobody reads. Asking for a score
+  // over WhatsApp would need an approved template and a way to receive a number
+  // back as a rating; that is a channel feature, not a null check, and it is not
+  // built. Response rate is a reported metric, so a skip that says why is worth
+  // more here than a send that quietly fails.
+  if (!customer.email) {
+    return { status: 'skipped', reason: 'customer has no email address' };
+  }
+
   const recent = await repository.lastForCustomer(customer.id);
   if (recent && withinCooldown(recent.createdAt)) {
     // Survey fatigue is the fastest way to a response rate of zero. A customer

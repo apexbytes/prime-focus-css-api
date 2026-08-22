@@ -3,6 +3,10 @@ import type { Actor } from '../../common/types/actor.js';
 import { withTransaction, type Executor } from '../../db/transaction.js';
 import { createModuleLogger } from '../../lib/logger/index.js';
 import * as auditService from '../audit/audit.service.js';
+// Cyclic with conversation.service, and deliberately: a merge has to move the
+// duplicate's channel identities, and the inbound pipeline has to be able to
+// create a customer. Both sides call the other only inside function bodies.
+import * as conversationService from '../conversation/conversation.service.js';
 import * as productService from '../product/product.service.js';
 import type { CustomerRow, CustomerTier } from './customer.model.js';
 import * as repository from './customer.repository.js';
@@ -88,6 +92,42 @@ export async function create(
 }
 
 /**
+ * Creates a customer who has reached the desk on a channel that carries no email
+ * address — WhatsApp, or the chat widget.
+ *
+ * Deliberately separate from `findOrCreateFromEmail` rather than a nullable
+ * parameter on it, because the two do different things: that one *finds* by the
+ * address, which is the identity key for mail, and this one cannot find anything
+ * because there is nothing here to match on. The matching for these channels is
+ * done by the `conversation` module against `customer_channel_identities`, and
+ * it is that module's job to only call this when the identity is new — the same
+ * division the `sso` module keeps between "which account is this" and "make an
+ * account".
+ *
+ * No actor and no audit row, matching `findOrCreateFromEmail`: an inbound message
+ * from a stranger is not somebody's decision to create a customer record.
+ */
+export async function createFromChannel(
+  input: { fullName: string; phone?: string | undefined; language?: string | undefined },
+  exec?: Executor,
+): Promise<CustomerRow> {
+  const customer = await repository.insert(
+    {
+      // Null rather than a synthesised placeholder: see the column comment on
+      // `customers.email`. Every send path asks whether there is an address.
+      email: null,
+      fullName: input.fullName,
+      phone: input.phone ?? null,
+      ...(input.language ? { language: input.language } : {}),
+    },
+    exec,
+  );
+
+  log.info('customer created from a channel identity', { customerId: customer.id });
+  return customer;
+}
+
+/**
  * Finds the customer behind an inbound email, creating a stub record when the
  * address is new. Called from the inbound pipeline, where there is no actor.
  */
@@ -117,6 +157,13 @@ export async function update(
   id: string,
   patch: {
     fullName?: string | undefined;
+    /**
+     * Settable since Phase 8, because a customer can now exist without one: an
+     * agent talking to somebody on WhatsApp who offers their address should be
+     * able to record it, and until they do every email path for that customer
+     * has nowhere to go.
+     */
+    email?: string | undefined;
     phone?: string | null | undefined;
     language?: string | undefined;
     tier?: CustomerTier | undefined;
@@ -126,11 +173,18 @@ export async function update(
 ): Promise<CustomerWithAccounts> {
   const before = await requireById(id);
 
+  const email = patch.email === undefined ? undefined : normaliseEmail(patch.email);
+  if (email !== undefined && email !== before.email) {
+    const clash = await repository.findByEmail(email);
+    if (clash) throw AppError.conflict('A customer with this email already exists');
+  }
+
   await withTransaction(async ({ tx }) => {
     const row = await repository.update(
       id,
       {
         ...(patch.fullName !== undefined ? { fullName: patch.fullName } : {}),
+        ...(email !== undefined ? { email } : {}),
         ...(patch.phone !== undefined ? { phone: patch.phone } : {}),
         ...(patch.language !== undefined ? { language: patch.language } : {}),
         ...(patch.tier !== undefined ? { tier: patch.tier } : {}),
@@ -239,6 +293,14 @@ export async function merge(
   await withTransaction(async ({ tx }) => {
     await repository.reassignAccounts(duplicateId, survivorId, tx);
     const movedTickets = await repository.reassignTickets(duplicateId, survivorId, tx);
+    // The duplicate's WhatsApp number and chat sessions follow it, otherwise the
+    // next message from that number would be filed against a merged-away record
+    // and the merge would silently undo itself.
+    const movedIdentities = await conversationService.reassignIdentities(
+      duplicateId,
+      survivorId,
+      tx,
+    );
 
     await repository.update(
       duplicateId,
@@ -252,16 +314,40 @@ export async function merge(
         entityType: 'customer',
         entityId: survivorId,
         before: { duplicateId, duplicateEmail: duplicate.email },
-        after: { survivorId, survivorEmail: survivor.email, ticketsMoved: movedTickets },
+        after: {
+          survivorId,
+          survivorEmail: survivor.email,
+          ticketsMoved: movedTickets,
+          channelIdentitiesMoved: movedIdentities,
+        },
       },
       actor,
       tx,
     );
 
-    log.info('customers merged', { survivorId, duplicateId, ticketsMoved: movedTickets });
+    log.info('customers merged', {
+      survivorId,
+      duplicateId,
+      ticketsMoved: movedTickets,
+      channelIdentitiesMoved: movedIdentities,
+    });
   });
 
   return get(survivorId);
+}
+
+// -- housekeeping ------------------------------------------------------------
+
+/**
+ * Removes any of these that turn out to be customers of nothing.
+ *
+ * Called by the conversation sweep after it reaps an abandoned chat thread. It
+ * lives here rather than in that sweep because `customers` is this module's
+ * table and whether a row is worth keeping is this module's judgement — the
+ * caller supplies candidates, not a decision.
+ */
+export function deleteOrphans(customerIds: readonly string[]): Promise<number> {
+  return repository.deleteOrphans(customerIds);
 }
 
 // -- retention ---------------------------------------------------------------

@@ -243,7 +243,10 @@ export async function create(
  *
  * `agent` is excluded deliberately: a ticket raised during a phone call would
  * email a confirmation to someone who has just hung up after being told their
- * reference out loud.
+ * reference out loud. `chat` and `whatsapp` are excluded for the same reason and
+ * get their acknowledgement in the thread they are standing in — see
+ * `conversation.service.acknowledgeInChannel` — because emailing a reference to
+ * somebody mid-conversation on WhatsApp is the same mistake in a new channel.
  */
 const ACKNOWLEDGED_CHANNELS = new Set<TicketChannel>(['email', 'web_form', 'api']);
 
@@ -257,10 +260,16 @@ const ACKNOWLEDGED_CHANNELS = new Set<TicketChannel>(['email', 'web_form', 'api'
 async function acknowledgeToCustomer(
   ticket: TicketRow,
   productName: string,
-  customer: { email: string; fullName: string },
+  customer: { email: string | null; fullName: string },
   input: CreateTicketInput,
 ): Promise<void> {
   if (!ACKNOWLEDGED_CHANNELS.has(ticket.channel)) return;
+  // Since Phase 8 a customer may have no address at all. On the channels in the
+  // set above one always does — they are the channels an address arrives on —
+  // but the type says otherwise and pretending it does not would be the kind of
+  // assumption that becomes a crash the first time a product system raises a
+  // ticket for a WhatsApp customer by id.
+  if (!customer.email) return;
 
   try {
     const messageId = await emailService.sendTicketAcknowledgement({

@@ -8,6 +8,7 @@ import { startSignals, stopSignals } from './lib/cache/index.js';
 import { startQueue, stopQueue } from './lib/queue/index.js';
 import { closeRedis } from './lib/redis/index.js';
 import { stopSocketServer } from './lib/socket/index.js';
+import { startChat } from './modules/chat/index.js';
 import { startRealtime } from './modules/realtime/index.js';
 
 const log = createModuleLogger('server');
@@ -43,6 +44,15 @@ export function startServer(): Server {
   // bargain the queue makes.
   void startRealtime(server).catch((error: unknown) => {
     log.error('realtime server failed to start; the console will fall back to polling', {
+      err: error,
+    });
+  });
+
+  // Its own namespace on the same server, started after it for the same reason.
+  // A chat gateway that fails to attach leaves the widget polling the REST
+  // endpoints, which is why those exist.
+  void startChat(server).catch((error: unknown) => {
+    log.error('chat gateway failed to start; the widget will fall back to polling', {
       err: error,
     });
   });

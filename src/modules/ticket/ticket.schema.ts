@@ -38,6 +38,14 @@ export const createTicketBody = z
     productId: z.uuid(),
     subject: z.string().trim().min(3).max(255),
     body: z.string().trim().min(1).max(50_000),
+    /**
+     * Deliberately not every `ticket_channel` value. `email`, `chat` and
+     * `whatsapp` are the origins of tickets their own inbound pipelines create,
+     * and each implies a thread on the other side — a `Message-ID` to reply
+     * against, a conversation row to send down. An API caller claiming one would
+     * be claiming a conversation that does not exist, and the reply would have
+     * nowhere to go.
+     */
     channel: z.enum(['web_form', 'api', 'agent']).default('agent'),
     priority: priority.optional(),
     categoryId: z.uuid().optional(),

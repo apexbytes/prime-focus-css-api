@@ -21,6 +21,14 @@ export default defineConfig({
       // which the issuer guard refuses by default and production refuses
       // outright.
       SSO_ALLOW_INSECURE_ISSUER: 'true',
+      // The omnichannel suite signs its own WhatsApp webhooks, so the app
+      // secret has to be present at boot for the ingress to accept anything.
+      WHATSAPP_APP_SECRET: 'test-whatsapp-app-secret',
+      WHATSAPP_VERIFY_TOKEN: 'test-whatsapp-verify-token',
+      // No access token and no phone number id, so `whatsappTransport` resolves
+      // to `log`: the suite asserts on the outbox instead of calling Meta.
+      WHATSAPP_PRODUCT_CODE: 'pf_wallet',
+      CHAT_PRODUCT_CODE: 'pf_wallet',
     },
     coverage: {
       provider: 'v8',
