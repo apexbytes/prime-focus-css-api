@@ -724,7 +724,7 @@ async function send(
   channel: ConversationChannel,
   conversation: ChannelConversationRow,
   body: string,
-  kind: 'ticket_reply' | 'ticket_acknowledgement',
+  kind: 'ticket_reply' | 'ticket_acknowledgement' | 'csat_survey',
   refs: { ticketId?: string | null; ticketMessageId?: string },
 ): Promise<{ delivered: boolean; error?: string }> {
   const record = async (
@@ -804,6 +804,68 @@ async function send(
 
   await record(sent.delivered ? 'sent' : 'failed', sent.messageId, sent.error ?? null);
   return { delivered: sent.delivered, ...(sent.error ? { error: sent.error } : {}) };
+}
+
+/**
+ * Whether a resolved ticket's customer can still be reached on its channel, an
+ * hour after the fact, to be asked how it went.
+ *
+ * Exists so `survey.dispatch` can decide *before* writing a survey row: a row
+ * that could never be delivered would sit with `sent_at` null forever and drag
+ * down a response rate it was never part of.
+ *
+ * **WhatsApp yes, live chat no**, and the asymmetry is the point. A phone number
+ * still reaches somebody an hour later; a closed browser tab does not, and the
+ * chat transport records a send as delivered whether or not anybody is
+ * listening — so surveying chat would inflate the denominator with surveys
+ * nobody could have seen. That is the same reason the original code skipped
+ * rather than sent, kept rather than quietly dropped.
+ */
+export async function surveyableChannel(
+  ticketId: string,
+): Promise<{ channel: ConversationChannel | null; reason?: string }> {
+  const conversation = await repository.findConversationForTicket(ticketId);
+
+  if (!conversation || conversation.status !== 'open') {
+    return { channel: null, reason: 'no open conversation to reach the customer on' };
+  }
+
+  if (conversation.channel === 'chat') {
+    return { channel: null, reason: 'a live chat session is not a lasting address' };
+  }
+
+  return { channel: 'whatsapp' };
+}
+
+/**
+ * Sends a survey invitation down the channel the ticket came in on.
+ *
+ * Deliberately the same `send` the replies and acknowledgements use, so the
+ * 24-hour window, the template fallback and the outbound record all apply here
+ * without being restated. That matters most for the window: an hour after
+ * resolution a conversation is usually still open, but a ticket resolved
+ * overnight is not, and this must not be the one send path that pretends
+ * otherwise.
+ *
+ * No message is written to the thread. The survey is a courtesy to the customer,
+ * not a reply from the desk, and an agent scrolling the ticket does not need a
+ * copy of it — the `outbound_channel_messages` row is the record that it went.
+ */
+export async function sendSurveyInvite(input: {
+  ticketId: string;
+  body: string;
+}): Promise<{ delivered: boolean; reason?: string }> {
+  const conversation = await repository.findConversationForTicket(input.ticketId);
+
+  if (!conversation || !isConversationChannel(conversation.channel)) {
+    return { delivered: false, reason: 'no channel conversation for this ticket' };
+  }
+
+  const result = await send(conversation.channel, conversation, input.body, 'csat_survey', {
+    ticketId: input.ticketId,
+  });
+
+  return { delivered: result.delivered, ...(result.error ? { reason: result.error } : {}) };
 }
 
 /**

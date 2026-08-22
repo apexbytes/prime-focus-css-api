@@ -34,7 +34,7 @@ export interface OutboundWhatsappMessage {
   to: string;
   body: string;
   /** Categorises the send in logs, exactly as the email adapter's `kind` does. */
-  kind: 'ticket_reply' | 'ticket_acknowledgement' | 'template';
+  kind: 'ticket_reply' | 'ticket_acknowledgement' | 'csat_survey' | 'template';
 }
 
 /**

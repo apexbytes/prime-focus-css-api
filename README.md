@@ -605,10 +605,33 @@ the thread rather than in a log:
 Either way the customer's message itself survives — losing it because a download
 timed out would be much worse than a ticket with no file on it.
 
-One gap stated rather than hidden: a customer with no address **gets no CSAT
-survey**. The survey is an email with a tokenised link, and `survey.dispatch`
-answers `skipped: customer has no email address` rather than sending into
-nothing.
+**The satisfaction survey goes down the channel too.** An address wins whenever
+there is one — a link in a mailbox outlives any conversation — and failing that,
+WhatsApp gets the same tokenised link as plain text:
+
+```
+Your Prime Focus Wallet query PF-2026-000123 is resolved.
+How did we do? Tap to rate from 1 to 5:
+
+https://app.primefocus.co.zw/survey?token=…
+```
+
+One link rather than the five per-score shortcuts the email uses: five URLs reads
+as spam, and link previews are off on this channel anyway. The token, its
+fourteen-day expiry, the one-per-ticket rule, the cooldown and
+`GET`/`POST /surveys/:token` are all unchanged, so a score arrives exactly as an
+emailed one does — and so does the CSAT reporting.
+
+**Live chat is not surveyed.** A phone number still reaches somebody an hour
+after resolution; a closed browser tab does not, and the chat transport records a
+send as delivered whether or not anyone is listening. Asking there would inflate
+the response-rate denominator with surveys nobody could have seen. Same reasoning
+for a survey the provider refuses: its row keeps `sent_at` null, because a survey
+nobody received is not a survey nobody answered.
+
+An agent who gets an address out of a WhatsApp customer can record it with
+`PATCH /customers/:id { "email": … }`, and every email path — the survey
+included — starts working for them.
 
 ### Live chat
 

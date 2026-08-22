@@ -24,6 +24,7 @@ import {
   outboundChannelMessages,
 } from '../../src/modules/conversation/conversation.model.js';
 import { customers } from '../../src/modules/customer/customer.model.js';
+import { csatSurveys } from '../../src/modules/survey/survey.model.js';
 import { ticketMessages } from '../../src/modules/message/message.model.js';
 import { startRealtime } from '../../src/modules/realtime/index.js';
 import { tickets } from '../../src/modules/ticket/ticket.model.js';
@@ -820,26 +821,134 @@ describe.skipIf(!enabled)('phase 8: omnichannel channels', () => {
 
   // -- the seams this phase had to leave intact ------------------------------
 
-  it('skips the satisfaction survey for a customer with no address, and says why', async () => {
-    await postWhatsapp(messagesEnvelope());
-    const [ticket] = await db.select().from(tickets);
+  describe('the satisfaction survey', () => {
+    /** Resolves a ticket the way the desk does, so a survey is due. */
+    async function resolve(ticketId: string): Promise<void> {
+      await request(app)
+        .post(`/api/v1/tickets/${ticketId}/messages`)
+        .set(...bearer(agentToken))
+        .send({ body: 'Traced and refunded.', visibility: 'public' });
 
-    await request(app)
-      .post(`/api/v1/tickets/${ticket!.id}/messages`)
-      .set(...bearer(agentToken))
-      .send({ body: 'Traced and refunded.', visibility: 'public' });
+      await request(app)
+        .patch(`/api/v1/tickets/${ticketId}`)
+        .set(...bearer(adminToken))
+        .send({ status: 'resolved' });
+    }
 
-    await request(app)
-      .patch(`/api/v1/tickets/${ticket!.id}`)
-      .set(...bearer(adminToken))
-      .send({ status: 'resolved' });
+    it('asks a WhatsApp customer for a score on WhatsApp, and takes the answer', async () => {
+      await postWhatsapp(messagesEnvelope());
+      const [ticket] = await db.select().from(tickets);
 
-    const { dispatch } = await import('../../src/modules/survey/survey.service.js');
-    const result = await dispatch(ticket!.id);
+      // `survey.dispatch` is enqueued by the resolve itself and the queue is
+      // inline under test, so this is the real path rather than a hand-driven
+      // call to the service.
+      await resolve(ticket!.id);
 
-    // Not a crash, and not an email into a black hole: a skip with a reason,
-    // because the response rate is itself a reported number.
-    expect(result).toEqual({ status: 'skipped', reason: 'customer has no email address' });
+      // It went over WhatsApp, not by email — there is no address to email.
+      const invite = readWhatsappOutbox().find((message) => message.kind === 'csat_survey');
+      expect(invite?.to).toBe(CUSTOMER_NUMBER);
+      expect(invite?.body).toContain(ticket!.reference);
+      expect(readOutbox().some((message) => message.kind === 'csat_survey')).toBe(false);
+
+      // One link, not one per score.
+      const links = invite!.body.match(/https?:\/\/\S+/g) ?? [];
+      expect(links).toHaveLength(1);
+
+      // And the link is the ordinary survey token, so the score comes back
+      // through the same public endpoint an emailed one uses.
+      const token = new URL(links[0] as string).searchParams.get('token');
+      expect(token).toBeTruthy();
+
+      const prompt = await request(app).get(`/api/v1/surveys/${token}`);
+      expect(prompt.status).toBe(200);
+      expect(prompt.body.data.reference).toBe(ticket!.reference);
+
+      const rated = await request(app)
+        .post(`/api/v1/surveys/${token}`)
+        .send({ score: 4, comment: 'Sorted quickly.' });
+
+      expect(rated.status).toBe(200);
+
+      const [survey] = await db.select().from(csatSurveys);
+      expect(survey?.score).toBe(4);
+      expect(survey?.sentAt).not.toBeNull();
+    });
+
+    it('still skips a live-chat customer, because a closed tab is not an address', async () => {
+      const started = await request(app)
+        .post('/api/v1/chat/sessions')
+        .send({ displayName: 'Rudo' });
+
+      await request(app)
+        .post('/api/v1/chat/messages')
+        .set('authorization', `Bearer ${started.body.data.sessionToken}`)
+        .send({ body: 'My card was declined.' });
+
+      const [ticket] = await db.select().from(tickets);
+      await resolve(ticket!.id);
+
+      // Sending here would record a delivery nobody could have seen and inflate
+      // the response-rate denominator, which is the whole reason to skip. No row
+      // was written, so asking again returns the real reason rather than
+      // "already surveyed".
+      expect(await db.select().from(csatSurveys)).toHaveLength(0);
+
+      const { dispatch } = await import('../../src/modules/survey/survey.service.js');
+      expect(await dispatch(ticket!.id)).toEqual({
+        status: 'skipped',
+        reason: 'a live chat session is not a lasting address',
+      });
+    });
+
+    it('leaves the survey unsent when the reply window has closed', async () => {
+      await postWhatsapp(messagesEnvelope());
+      const [ticket] = await db.select().from(tickets);
+
+      // Resolved overnight: by dispatch the window is gone, and no re-open
+      // template is configured in this suite. Wound back before resolving,
+      // because the resolve is what dispatches.
+      await db
+        .update(channelConversations)
+        .set({ windowExpiresAt: new Date(Date.now() - 60_000) })
+        .where(eq(channelConversations.ticketId, ticket!.id));
+
+      await resolve(ticket!.id);
+
+      expect(readWhatsappOutbox().some((message) => message.kind === 'csat_survey')).toBe(false);
+
+      // The row exists and is unsent, which is what keeps the response rate
+      // honest: a survey nobody received is not a survey nobody answered.
+      const [survey] = await db.select().from(csatSurveys);
+      expect(survey?.sentAt).toBeNull();
+      expect(survey?.score).toBeNull();
+
+      // And the refusal is recorded with its reason, like any other send.
+      const [refused] = await db
+        .select()
+        .from(outboundChannelMessages)
+        .where(eq(outboundChannelMessages.kind, 'csat_survey'));
+
+      expect(refused?.status).toBe('failed');
+      expect(refused?.error).toContain('window has closed');
+    });
+
+    it('still emails a customer who has an address, whatever channel they used', async () => {
+      await postWhatsapp(messagesEnvelope());
+      const [whatsappCustomer] = await db.select().from(customers);
+
+      // An agent has since recorded the address the customer gave them.
+      await request(app)
+        .patch(`/api/v1/customers/${whatsappCustomer!.id}`)
+        .set(...bearer(adminToken))
+        .send({ email: 'tendai@example.co.zw' });
+
+      const [ticket] = await db.select().from(tickets);
+      await resolve(ticket!.id);
+
+      // An address wins: a link in a mailbox outlives any reply window.
+      expect(readOutbox().some((message) => message.kind === 'csat_survey')).toBe(true);
+      expect(readWhatsappOutbox().some((message) => message.kind === 'csat_survey')).toBe(false);
+    });
   });
 
   it('moves a WhatsApp number onto the survivor when two customers are merged', async () => {

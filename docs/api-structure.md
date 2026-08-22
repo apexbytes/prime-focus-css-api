@@ -234,7 +234,7 @@ Grouped by domain; each is a folder in `src/modules/`.
 ### 3.5 Self-service & feedback
 
 - **knowledge-base** — articles with draft/in_review/published/archived states, product + category scoping, Postgres full-text search (`tsvector` generated column, weighted title/keywords/body, GIN), per-edit revisions, view + helpfulness counters, and the `suggest` endpoint the ticket-creation flow calls for deflection. `visibility: internal | public` is required with no default and defaults to `internal` in the database: `internal` articles are agent runbooks, and `suggest` exists to show text to customers.
-- **survey** — CSAT: a token-based one-click rating emailed after resolution, score + comment. The token is the only bearer credential this API accepts in a URL, and the trade-off is argued in §8. Aggregation lives in `report`.
+- **survey** — CSAT: a token-based one-click rating sent after resolution — emailed when the customer has an address, otherwise sent down the channel the ticket arrived on (§8) — score + comment. The token is the only bearer credential this API accepts in a URL, and the trade-off is argued in §8. Aggregation lives in `report`.
 
 ### 3.6 Platform services
 
@@ -1392,11 +1392,37 @@ Decisions worth knowing:
   deletes it with the ticket. A customer-supplied filename is stripped to a
   basename and never becomes a storage key.
 
-- **CSAT is skipped, not adapted.** The survey is an email with a tokenised link;
-  asking for a score over WhatsApp needs an approved template and a way to read a
-  digit back as a rating. `dispatch` answers `skipped` with a reason, because
-  response rate is itself a reported number and a send that quietly fails would
-  corrupt it.
+- **CSAT goes down the channel too, as the same tokenised link.** Added as a
+  follow-up alongside media. `survey.dispatch` had the defect `message.service`
+  had before this phase — a send path fused to email — so it got the same fix: it
+  asks where the customer can be reached and routes accordingly, through the same
+  `send` the replies use, so the reply window, the template fallback and the
+  outbound record all apply without being restated.
+
+  An address wins whenever there is one, because a link in a mailbox outlives any
+  conversation. Failing that, WhatsApp gets the ordinary survey link as plain
+  text — one link, not the five per-score shortcuts the email uses, since five
+  URLs in a WhatsApp message reads as spam and link previews are off on that
+  channel anyway. The token, the fourteen-day expiry, the one-per-ticket
+  constraint, the cooldown and `GET`/`POST /surveys/:token` are untouched, so a
+  score arrives by exactly the path an emailed one does.
+
+  **Live chat is still skipped, and that is a decision rather than an
+  oversight.** A phone number still reaches somebody an hour after resolution; a
+  closed browser tab does not, and the chat transport records a send as delivered
+  whether or not anybody is listening. Surveying it would inflate the
+  response-rate denominator with surveys nobody could have seen — which is what
+  the original skip was protecting, so it is kept and given a clearer reason. For
+  the same reason a survey the provider refuses leaves its row with `sent_at`
+  null: a survey nobody received is not a survey nobody answered.
+
+  Reply buttons would be better than a link — an `interactive` payload cannot be
+  misread the way a digit can — but they need inbound handling for that type and
+  a quick-reply template approved in Meta's console, so they stay a follow-up.
+  Parsing a digit out of the next message is the option deliberately **not**
+  taken: a customer answering "5" to mean five days would be recorded as a
+  rating, and the message would be stolen from the thread rather than filed.
+
 - **A visitor's rate limit lives in the service, not in middleware.** A socket
   frame never passes through an Express limiter, so without it one visitor could
   write a thousand messages into a ticket. It is counted through the shared cache
@@ -1559,10 +1585,12 @@ Called out so the trade-offs are explicit, not silently dropped:
    and a retention argument of its own, and adding `phone` to the enum without
    them would be schema pretending to be a feature.
 
-   One gap remains inside the channels that _are_ built, stated rather than
-   hidden: CSAT is skipped for a customer with no address rather than asked over
-   the channel, which needs an approved template and a way to read a digit back
-   as a rating. Inbound media was the other one and is now built — see §8.
+   Both gaps this phase shipped with are now closed — inbound media is
+   downloaded, and CSAT is asked over the channel as the same tokenised link
+   (§8). What remains is narrower and deliberate: live chat is not surveyed,
+   because a closed browser tab is not somewhere to reach anybody an hour later,
+   and a score is collected through a link rather than reply buttons, which would
+   need a template approved in Meta's console.
 
 4. **Data lake → materialised views.** Real-time dashboards come from Postgres
    materialised views refreshed on a schedule, as built in Phase 5: six views,
