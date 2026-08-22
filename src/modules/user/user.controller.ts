@@ -1,7 +1,7 @@
 import type { Request, Response } from 'express';
 import { AppError } from '../../common/errors/index.js';
 import { isUserActor, type Actor } from '../../common/types/actor.js';
-import { sendSuccess } from '../../common/utils/response.js';
+import { sendNoContent, sendSuccess } from '../../common/utils/response.js';
 import * as userService from './user.service.js';
 import type {
   ChangeAvailabilityBody,
@@ -58,6 +58,11 @@ export async function changeRole(req: Request, res: Response): Promise<void> {
 export async function changeStatus(req: Request, res: Response): Promise<void> {
   const { status } = req.body as ChangeStatusBody;
   sendSuccess(res, await userService.changeStatus(req.params.id as string, status, actorOf(req)));
+}
+
+export async function deleteUser(req: Request, res: Response): Promise<void> {
+  await userService.deleteUser(req.params.id as string, actorOf(req));
+  sendNoContent(res);
 }
 
 /** Self-service profile edit, so an agent does not need `user:manage`. */

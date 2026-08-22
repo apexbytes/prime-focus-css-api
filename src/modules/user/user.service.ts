@@ -8,7 +8,11 @@ import * as auditService from '../audit/audit.service.js';
 // login has to read users. Both sides export hoisted function declarations and
 // touch each other only inside function bodies, so the cycle resolves safely.
 import * as authService from '../auth/auth.service.js';
+// Cyclic with invitation.service for the same reason and on the same terms:
+// deleting an account has to kill the link that would still create it.
+import * as invitationService from '../invitation/invitation.service.js';
 import * as roleService from '../role/role.service.js';
+import { OPEN_STATUSES } from '../ticket/ticket.status.js';
 import * as repository from './user.repository.js';
 import type {
   AgentAvailability,
@@ -228,6 +232,71 @@ export async function changeStatus(
 
   log.info('user status changed', { userId: id, status });
   return toPublicUser({ ...user, ...updated });
+}
+
+/**
+ * Removes a staff account from the roster.
+ *
+ * Soft delete: the row survives so that audit entries, ticket history and old
+ * assignments keep resolving to a person. What goes is everything that makes the
+ * account *usable* — sessions, trusted devices and any invitation link still in
+ * an inbox — and its place in the roster.
+ */
+export async function deleteUser(id: string, actor: Actor): Promise<void> {
+  const user = await requireById(id);
+
+  if (isUserActor(actor) && actor.id === id) {
+    throw new AppError(409, ErrorCode.SELF_ACTION_FORBIDDEN, 'You cannot delete your own account');
+  }
+
+  // Only when the target is active: a suspended super administrator is not part
+  // of the count this guards, so checking them would block on a colleague who is
+  // still there.
+  if (user.roleCode === SUPER_ADMIN_ROLE_CODE && user.status === 'active') {
+    await assertNotLastSuperAdmin(user);
+  }
+
+  // Refused rather than silently reassigned, for the same reason a role with
+  // holders cannot be deleted: who picks the work up is an operational decision,
+  // not one this endpoint should make on someone's behalf.
+  const openTickets = await repository.countOpenAssignedTickets(id, OPEN_STATUSES);
+  if (openTickets > 0) {
+    throw new AppError(
+      409,
+      ErrorCode.USER_HAS_OPEN_TICKETS,
+      `This account still holds ${openTickets} open ${openTickets === 1 ? 'ticket' : 'tickets'}; reassign them first`,
+      { context: { userId: id, openTickets } },
+    );
+  }
+
+  await withTransaction(async ({ tx }) => {
+    // Written before the row changes, so the trail keeps the real email address
+    // that `softDelete` is about to tombstone.
+    await auditService.record(
+      {
+        action: 'user.deleted',
+        entityType: 'user',
+        entityId: id,
+        before: {
+          email: user.email,
+          fullName: user.fullName,
+          status: user.status,
+          roleCode: user.roleCode,
+        },
+        after: { deleted: true },
+      },
+      actor,
+      tx,
+    );
+
+    const row = await repository.softDelete(id, tx);
+    if (!row) throw AppError.notFound('User not found');
+
+    await authService.revokeAccess(id, tx, 'account_deleted');
+    await invitationService.revokeLiveForUser(id, tx);
+  });
+
+  log.info('user deleted', { userId: id, roleCode: user.roleCode, by: actor.kind });
 }
 
 async function assertNotLastSuperAdmin(user: UserWithRole): Promise<void> {

@@ -87,6 +87,43 @@ they should hold. They receive a link, choose a password at
 Seeded roles: `super_admin`, `admin`, `tier2_specialist`, `tier1_agent`. Only
 `super_admin` can change what a role may do.
 
+### Taking someone off the desk
+
+Three separate acts, deliberately not one:
+
+```bash
+# perm user:manage. Reversible; sessions and trusted devices are revoked.
+curl -X PATCH localhost:3000/api/v1/users/$ID/status \
+  -H "authorization: Bearer $TOKEN" -H 'content-type: application/json' \
+  -d '{"status":"suspended"}'
+
+# perm user:invite. Only before the link is used.
+curl -X DELETE localhost:3000/api/v1/invitations/$INVITATION_ID \
+  -H "authorization: Bearer $TOKEN"
+
+# perm user:delete. Off the roster for good.
+curl -X DELETE localhost:3000/api/v1/users/$ID \
+  -H "authorization: Bearer $TOKEN"
+```
+
+Deleting is a soft delete: the row stays so that audit entries, ticket history
+and old assignments keep resolving to a name, but the account disappears from
+`GET /api/v1/users`, its sessions and trusted devices are revoked, any invitation
+link still sitting in an inbox stops working, and the email address is released
+so the person can be invited again later. The address is preserved in the
+`user.deleted` audit entry, which is the only place it survives.
+
+Three refusals, all `409`:
+
+| Code                    | When                                                  |
+| ----------------------- | ----------------------------------------------------- |
+| `SELF_ACTION_FORBIDDEN` | You are deleting your own account                     |
+| `LAST_SUPER_ADMIN`      | It is the only active super administrator             |
+| `USER_HAS_OPEN_TICKETS` | Their queue is not empty — reassign the tickets first |
+
+Every one of these is audited under `entityType=user`: `user.suspended`,
+`user.reactivated`, `user.invitation_revoked` and `user.deleted`.
+
 ### Through an identity provider
 
 Staff can also sign in through Google, Microsoft Entra or any OpenID Connect

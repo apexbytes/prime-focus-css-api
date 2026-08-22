@@ -521,7 +521,11 @@ export async function revokeSession(actor: UserActor, sessionId: string): Promis
 
   await repository.revokeSession(sessionId, 'user_signed_out');
   await auditService.recordSafely(
-    { action: 'auth.session_revoked', entityType: 'session', entityId: sessionId },
+    {
+      action: 'auth.session_revoked',
+      entityType: 'session',
+      entityId: sessionId,
+    },
     actor,
   );
 }
@@ -551,9 +555,17 @@ export async function logoutEverywhere(actor: UserActor): Promise<{ sessionsRevo
   return { sessionsRevoked };
 }
 
-/** Hook handed to the user module when an account is suspended. */
-export async function revokeAccess(userId: string, exec: Executor): Promise<void> {
-  await repository.revokeAllForUser(userId, 'account_suspended', exec);
+/**
+ * Hook handed to the user module when an account stops being usable. The reason
+ * lands on every revoked session, so suspension and deletion stay tellable apart
+ * when someone reads the session trail afterwards.
+ */
+export async function revokeAccess(
+  userId: string,
+  exec: Executor,
+  reason = 'account_suspended',
+): Promise<void> {
+  await repository.revokeAllForUser(userId, reason, exec);
   await mfaService.revokeAllDevices(userId, exec);
 }
 

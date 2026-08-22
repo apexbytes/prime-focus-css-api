@@ -13,6 +13,7 @@ import {
   changeOwnAvailability,
   changeRole,
   changeStatus,
+  deleteUser,
   getUser,
   listUsers,
   updateOwnProfile,
@@ -52,6 +53,16 @@ userRouter.patch(
   validate({ params: userIdParams, body: updateUserBody }),
   requireSelfOrPermission('id', 'user:manage'),
   updateUser,
+);
+
+// Its own permission rather than `user:manage`: removing someone from the
+// roster is a different act from editing them, and follows `ticket:delete` in
+// being separable from the day-to-day management grant.
+userRouter.delete(
+  '/:id',
+  requirePermission('user:delete'),
+  validate({ params: userIdParams }),
+  deleteUser,
 );
 
 userRouter.patch(

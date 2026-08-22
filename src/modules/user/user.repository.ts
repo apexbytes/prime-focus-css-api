@@ -1,7 +1,8 @@
-import { and, asc, eq, gt, ilike, isNull, or, sql } from 'drizzle-orm';
+import { and, asc, eq, gt, ilike, inArray, isNull, or, sql } from 'drizzle-orm';
 import { db } from '../../db/client.js';
 import type { Executor } from '../../db/transaction.js';
 import { roles } from '../role/role.model.js';
+import { tickets, type TicketStatus } from '../ticket/ticket.model.js';
 import { users, type NewUser, type UserRow } from './user.model.js';
 import type { ListUsersFilter, UserWithRole } from './user.types.js';
 
@@ -97,6 +98,56 @@ export async function countActiveByRoleCode(code: string, exec: Executor = db): 
     .where(and(eq(roles.code, code), eq(users.status, 'active'), isNull(users.deletedAt)));
 
   return row?.count ?? 0;
+}
+
+/**
+ * Work that would be stranded by deleting this account. Deleted rows are already
+ * excluded from routing, so this counts what is *already* on their desk.
+ *
+ * The statuses come from the caller because the boundary rules let a repository
+ * reach another module's tables but not its constants, and `OPEN_STATUSES` is
+ * the ticket module's to define.
+ */
+export async function countOpenAssignedTickets(
+  id: string,
+  openStatuses: readonly TicketStatus[],
+  exec: Executor = db,
+): Promise<number> {
+  const [row] = await exec
+    .select({ count: sql<number>`count(*)::int` })
+    .from(tickets)
+    .where(
+      and(
+        eq(tickets.assignedToUserId, id),
+        inArray(tickets.status, [...openStatuses]),
+        isNull(tickets.deletedAt),
+      ),
+    );
+
+  return row?.count ?? 0;
+}
+
+/**
+ * Soft delete. The row stays so the audit trail and every historical
+ * `assigned_to_user_id` keep resolving to a name; every read in this repository
+ * already filters on `deletedAt`.
+ *
+ * The email is tombstoned rather than kept, because it is unique across the
+ * table: leaving it in place would make the address permanently un-invitable
+ * with no way back through the API. The original is preserved in the audit row.
+ */
+export async function softDelete(id: string, exec: Executor = db): Promise<UserRow | undefined> {
+  const [row] = await exec
+    .update(users)
+    .set({
+      deletedAt: new Date(),
+      email: `deleted+${id}@deleted.invalid`,
+      availability: 'offline',
+    })
+    .where(and(eq(users.id, id), isNull(users.deletedAt)))
+    .returning();
+
+  return row;
 }
 
 export async function recordFailedLogin(
