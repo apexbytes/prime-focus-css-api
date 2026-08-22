@@ -17,6 +17,10 @@ export default defineConfig({
       // be present at boot.
       RESEND_WEBHOOK_SECRET: 'whsec_dGVzdC13ZWJob29rLXNpZ25pbmcta2V5LTEyMw==',
       RATE_LIMIT_MAX: '100000',
+      // The federation suite runs a real OpenID provider on a loopback port,
+      // which the issuer guard refuses by default and production refuses
+      // outright.
+      SSO_ALLOW_INSECURE_ISSUER: 'true',
     },
     coverage: {
       provider: 'v8',

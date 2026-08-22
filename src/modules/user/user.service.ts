@@ -279,6 +279,22 @@ export function activate(
   );
 }
 
+/**
+ * Activates an invited account that arrived through an identity provider.
+ *
+ * Deliberately leaves `passwordHash` null rather than inventing one: the account
+ * has a credential — the link to the provider — and a random password nobody
+ * knows would only be a reset link away from being a second one. `login()`
+ * recognises the combination of `active` with no hash and says so.
+ */
+export function activateWithoutPassword(id: string, exec: Executor) {
+  return repository.update(
+    id,
+    { status: 'active', failedLoginAttempts: 0, lockedUntil: null },
+    exec,
+  );
+}
+
 export function setPassword(id: string, passwordHash: string, exec: Executor) {
   return repository.update(
     id,

@@ -18,6 +18,7 @@ endpoints, and build order. It is deliberately narrower than
 | Migrations         | `drizzle-kit` (SQL files, checked in)                                         | Reviewable, replayable, no runtime schema sync                                                                                              |
 | Validation         | Zod                                                                           | One schema drives runtime validation + inferred TS types                                                                                    |
 | Auth               | JWT access (15 min) + rotating refresh tokens in Postgres; Argon2id passwords | Stateless reads, revocable sessions                                                                                                         |
+| Federated sign-in  | OpenID Connect over `jose`; providers are rows (Phase 7)                      | SSO through Google, Microsoft Entra or any OIDC provider, as an extra strategy behind the same login result                                 |
 | MFA                | Emailed one-time code + 30-day trusted devices                                | No enrolment step, no shared secret at rest, and no authenticator app for agents to lose. Trusted devices keep the friction off every login |
 | Email              | Resend (outbound + inbound webhook)                                           | Requirement; inbound webhook is the email→ticket channel                                                                                    |
 | Logging            | Winston + `AsyncLocalStorage` correlation IDs                                 | Requirement; JSON to stdout, daily-rotate file in prod                                                                                      |
@@ -73,6 +74,7 @@ prime-focus-css/
 │   │
 │   ├── lib/                          # thin third-party adapters, swappable
 │   │   ├── logger/                   # winston setup + child loggers
+│   │   ├── oidc/                     # discovery, PKCE, code exchange, id_token verify
 │   │   ├── resend/                   # client wrapper, retry, template renderer
 │   │   ├── queue/                    # pg-boss bootstrap, job registry, schedules
 │   │   ├── storage/                  # object storage presign/get/delete
@@ -83,6 +85,7 @@ prime-focus-css/
 │   │
 │   ├── modules/                      # one folder per entity — see §3
 │   │   ├── auth/
+│   │   ├── sso/                      # federated sign-in: providers, links, one-shot requests
 │   │   ├── mfa/
 │   │   ├── user/
 │   │   ├── role/
@@ -187,6 +190,12 @@ Grouped by domain; each is a folder in `src/modules/`.
   rotation and reuse detection, logout, logout-everywhere, password reset and change,
   session listing and revocation. **There is no register or sign-up endpoint**: accounts
   exist only by invitation.
+- **sso** — federated sign-in. Owns the configured identity providers, the link between a
+  staff account and a subject at one, and the short-lived record of a sign-in in flight.
+  It authenticates; it does not issue sessions — that stays in `auth`, which is why a
+  federated login answers with exactly the same `authenticated` / `otp_required` result a
+  password login does. **It provisions nothing**: accounts still exist only by invitation,
+  and the most a provider can do is _activate_ an account somebody was already invited to.
 - **mfa** — issues and verifies the emailed login code, and manages trusted devices
   (`/auth/devices`). Not TOTP: there is no enrolment and no shared secret stored, so a
   lost phone costs nothing. A device that has passed one code may skip the challenge for
@@ -308,6 +317,23 @@ The six `report_*` materialised views are **not** in `schema.ts`. They are
 declared `.existing()` in `report.model.ts` and their DDL is hand-written in the
 migration — see §8.
 
+**Federation** — built in Phase 7
+`identity_providers`, `sso_identities`, `sso_login_requests`.
+
+`sso_identities` is unique on `(provider_id, subject)` **and** on
+`(provider_id, user_id)`: the first makes a provider's subject one account, and
+the second is what refuses a second subject arriving with an address that is
+already linked, rather than silently issuing a second key to the same account.
+Matching is on `subject`, never on the email — a mailbox gets reassigned, and a
+system that matched on the address would hand the leaver's tickets to whoever
+inherited it.
+
+`sso_login_requests` holds the `state` (as a digest, like every other credential
+a client presents), the nonce and the PKCE verifier, because this API has no
+cookie and no session for somebody who has not signed in yet. The row is consumed
+by the completion, which is what makes one authorization code redeemable once on
+our side as well as the provider's.
+
 **Platform**
 `notifications`, `notification_preferences`, `outbound_emails`,
 `email_events`, `webhook_subscriptions`, `webhook_deliveries`, `audit_logs`,
@@ -330,6 +356,8 @@ migration — see §8.
   one
 - `webhook_subscriptions (is_active, product_id)` — the fan-out's only query
 - `ticket_locks (socket_id)` — releasing everything a dropped connection held
+- `sso_login_requests (state_hash)` unique — the completion's only lookup, and the
+  replay guard: the `consumed_at is null` predicate lives in the same statement
 
 **Key state machine** — enforced in `ticket.service.ts`, not the DB:
 transitions are whitelisted, each one writes an `audit_log` row and emits a
@@ -357,6 +385,14 @@ GET    /auth/devices                DELETE /auth/devices/:id   (trusted devices)
 POST   /auth/password/forgot        { email }            (always 202)
 POST   /auth/password/reset         { token, password }   (revokes all sessions + devices)
 POST   /auth/password/change        { currentPassword, newPassword }
+
+GET    /auth/sso/providers          (public: the buttons the sign-in screen draws)
+POST   /auth/sso/start              { providerCode | providerId, returnPath? }
+                                    → { authorizationUrl, provider, expiresAt }
+POST   /auth/sso/callback           { state, code }   → the same result /auth/login gives
+GET    /auth/sso/identities         DELETE /auth/sso/identities/:id   (unlink my own)
+GET    /identity-providers          POST /identity-providers          (perm sso:read/manage)
+GET|PATCH|DELETE /identity-providers/:id
 
 POST   /invitations                 { email, fullName, roleId }   (perm user:invite)
 GET    /invitations                 POST /invitations/:id/resend
@@ -544,6 +580,11 @@ room is never a way around product scoping.
   published to the queue after commit.
 - **Rate limits.** Per-IP on `/auth/*`, per-actor on writes, per-API-key
   quotas for product systems.
+- **Secrets, and the two exceptions.** Everything presented _to_ this API as a bearer
+  value is stored as a digest, because it is only ever verified. The two values stored in
+  the clear are the ones this API _presents to somebody else_: a webhook subscription's
+  signing secret and an identity provider's client secret. A digest cannot be signed with
+  or sent, and both are write-only through the API — never returned, never in an audit row.
 - **Secrets.** Passwords are Argon2id. Everything else presented as a bearer value —
   refresh tokens, device tokens, invitation and reset tokens, API keys — is stored only
   as an HMAC-SHA256 digest keyed by `JWT_SECRET`, so a database leak yields nothing
@@ -553,7 +594,10 @@ room is never a way around product scoping.
   401, and both pay the same Argon2 cost (`burnPasswordVerify`). Lockout, suspension and
   not-yet-activated states are disclosed only to a caller who already supplied the correct
   password — except invited accounts, which have no password to check and must be told to
-  use their invitation. `POST /auth/password/forgot` always answers 202.
+  use their invitation. `POST /auth/password/forgot` always answers 202. Federated sign-in has its own posture:
+  by the time it can say "there is no account for this address", the caller has already
+  proved control of that address at the provider, so vagueness protects nobody and costs a
+  member of staff a support call.
 - **Revocation latency.** The authenticate middleware reads the user row on every request,
   so suspension and role changes take effect immediately rather than after the access
   token's 15 minutes. Role → permission lookups are cached in-process for 60 seconds and
@@ -1014,10 +1058,98 @@ Decisions worth knowing:
   makes every limiter pass rather than fail: taking the API down to protect it
   is the wrong direction.
 
-**Phase 7 — federation**
-OAuth2/OIDC SSO (Google/Microsoft) and, if an enterprise partner requires it,
-SAML — as an additional strategy behind the existing `auth` module, not a
-rewrite of it.
+**Phase 7 — federation** — _complete_
+`lib/oidc` and the `sso` module: OAuth2/OIDC single sign-on as an additional
+strategy behind the existing `auth` module. 3 more tables, 2 more permissions, 8
+more endpoints, and the first time this system trusts something outside it to say
+who somebody is.
+
+Verified end to end against a real OpenID provider the test suite starts on a
+loopback port — discovery document, published JWKS, signed `id_token`: an
+administrator configures a provider and is never shown its client secret again;
+an agent signs in through it and the identity is linked to their account; an
+invited colleague signs in the same way and is activated without ever choosing a
+password, their invitation link dying with the sign-in that replaced it; a
+captured `state` presented twice is refused before the provider is asked
+anything; a token minted for another client, carrying another sign-in's nonce, or
+naming an address on a domain the provider is not federated for, gets nobody in;
+and an account with no password is told where to sign in rather than that its
+password is wrong.
+
+Decisions worth knowing:
+
+- **SAML is not built.** The plan said "if an enterprise partner requires it",
+  and none has. It is a different protocol with its own XML signature surface —
+  worth adding as a third strategy the day a contract needs it, not before, and
+  the `sso` module's seam is where it would go.
+- **Providers are rows, not environment variables.** Adding a partner's tenant,
+  or removing an email domain that should no longer get in, is an
+  administrator's decision with an audit row — the same argument that makes
+  routing rules and SLA policies rows. The cost is a client secret in Postgres,
+  which is argued in §6 alongside the webhook signing secret: it is presented to
+  a token endpoint, and a digest cannot be presented.
+- **The provider redirects to the console, not to this API.** The console reads
+  `code` and `state` out of its own URL and posts them to
+  `POST /auth/sso/callback`, which answers with the ordinary token pair. The
+  alternative — the API handling the redirect — has to hand the session back
+  through a URL fragment or a cookie, and this system's rule about tokens never
+  travelling in a URL is older than this phase.
+- **`state` is a digest; the nonce and the PKCE verifier are not.** The `state`
+  comes back through a browser, which makes it a credential a client presents,
+  and those are stored hashed here without exception. The other two are never
+  presented to us: the nonce is compared against a claim the provider signed, and
+  the verifier is presented _by_ this system to the token endpoint.
+- **No provisioning.** A provider vouching for an address says who somebody is,
+  not that they work here, so there is still no way to come into existence except
+  by invitation. What a federated sign-in may do is _activate_ an invited
+  account — a verified assertion about the invited address proves exactly what
+  clicking the emailed link proves — and it marks the invitation accepted in the
+  same transaction, because otherwise the link stays live for another three days
+  after the account it belongs to is already in use.
+- **An account activated that way has no password, and `login` says so.** An
+  `active` user with no hash can only have arrived through a provider, which is a
+  different answer from `invited` and gets a different code
+  (`SSO_LOGIN_REQUIRED`). Password reset is deliberately still available to it: an
+  identity provider outage must not lock the desk out, and deprovisioning is done
+  by suspending the account here.
+- **Linking is on the provider's `subject`, and a second one is refused.** Email
+  match is used only to link an account that has never signed in through this
+  provider. After that the subject is the identity, because addresses get
+  reassigned; and a _new_ subject presenting an already-linked address is a 409
+  rather than a silent relink, since silently relinking on an email match is the
+  whole account-takeover path this ordering exists to close.
+- **An empty email-domain list federates nobody.** `https://accounts.google.com`
+  is the issuer for every consumer Google account in the world, so "no domains
+  configured" must not read as "any domain". The API refuses to create a provider
+  without one, and the policy check fails closed for a row that got there another
+  way.
+- **`email_verified` is a per-provider requirement, because Entra never sends
+  it.** Google always does; Microsoft does not emit the claim at all, so a
+  provider bound to one tenant is configured to accept its absence — deliberately,
+  by an administrator, rather than by a default that quietly accepts unverified
+  addresses. An explicit `email_verified: false` is refused whatever the
+  configuration says: a provider volunteering that is telling us something no
+  setting should override.
+- **The emailed code is skipped by default, and is one flag away.** The provider
+  is the authentication authority, and mailing a one-time code to an address it
+  has just proved control of is friction pretending to be a factor. A provider
+  whose own MFA cannot be relied on gets `requireOtp`, and then the response is
+  the same `otp_required` challenge the password flow issues — so the console
+  needs no new branch for it.
+- **The access token from the exchange is thrown away.** Only the `id_token` is
+  read. This system wants an identity, not a mailbox, and storing a token that
+  grants access to somebody's Google account would make this database worth
+  stealing for a reason that has nothing to do with support tickets.
+- **A provider cannot be deleted while anybody signs in through it, and does not
+  fail readiness.** Deletion cascades to the links, which for a passwordless
+  agent is a locked desk, so it is refused with a count and `isActive: false` is
+  the reversible way to stop offering it. And an unreachable provider is somebody
+  else's outage: `/readyz` says nothing about it, because an instance whose
+  Google is down still serves every ticket in the system.
+- **Expired sign-in requests are swept by the retention job.** Operational
+  debris, like a webhook delivery row: not personal data the Act has an opinion
+  about, and dropped by the pass that already runs weekly with permission to
+  delete things.
 
 ---
 
@@ -1047,10 +1179,17 @@ REALTIME_ENABLED, REALTIME_PATH, REALTIME_REAUTH_SECONDS,
 TICKET_LOCK_TTL_SECONDS, TICKET_LOCK_HEARTBEAT_SECONDS
 WEBHOOK_TIMEOUT_MS, WEBHOOK_MAX_ATTEMPTS, WEBHOOK_DISABLE_AFTER_FAILURES,
 WEBHOOK_DELIVERY_RETENTION_DAYS
+SSO_REDIRECT_URL, SSO_LOGIN_REQUEST_TTL_MINUTES, SSO_DISCOVERY_CACHE_SECONDS,
+SSO_HTTP_TIMEOUT_MS, SSO_ALLOW_INSECURE_ISSUER
 RATE_LIMIT_WINDOW, RATE_LIMIT_MAX
 API_KEY_RATE_LIMIT_WINDOW_MS, API_KEY_RATE_LIMIT_MAX
 DEFAULT_TIMEZONE=Africa/Harare
 ```
+
+Identity providers themselves are **not** here: issuer, client credentials and
+the email domains each may vouch for are rows, configured through
+`/identity-providers`. `SSO_ALLOW_INSECURE_ISSUER` exists so the test suite can
+run its own provider on a loopback port and is refused outright in production.
 
 Three settings are **not** runtime settings despite looking like they could be,
 because each is baked into stored SQL and changing it means a migration:
@@ -1083,6 +1222,13 @@ or malformed — never `process.env.X` anywhere else in the codebase.
 - **Webhooks** — an actual listener on a loopback port receives the delivery,
   and the test verifies the signature with the receiver's half of the scheme
   rather than re-running the signer.
+- **Federation** — the suite starts a real OpenID Connect provider on a loopback
+  port: it serves a discovery document, publishes a JWKS and signs `id_token`s
+  with a key it generated, and its token endpoint checks the client credentials
+  and recomputes the PKCE challenge from the verifier. A stubbed adapter would
+  assert that our own code was called and prove nothing about the signature,
+  audience, issuer, nonce or PKCE checks — which are the parts that are either
+  right or a way in.
 - **Authorisation matrix** — a table-driven test asserting each role × endpoint
   outcome. This is the one suite that must never be skipped: RBAC regressions
   in a fintech leak customer financial data.
@@ -1128,8 +1274,13 @@ Called out so the trade-offs are explicit, not silently dropped:
    plug into — `GET /kb/suggest` returns a ranked list and the caller does not
    care how it was ranked — but the ranking is lexical, so a customer describing
    a failed transfer in words no article uses gets nothing back.
-6. **SSO moved last.** Local auth plus the emailed second factor secures staff
-   now; SSO is an added strategy in Phase 7, not a prerequisite.
+6. **SSO moved last, and SAML is still out.** Local auth plus the emailed second
+   factor secured staff through six phases; Phase 7 added OIDC as an extra
+   strategy behind the same `auth` module rather than a rewrite of it, exactly as
+   planned. SAML is not built: the draft made it conditional on an enterprise
+   partner requiring it, none has, and it is a second protocol with its own XML
+   signature surface to get wrong. The seam for it is the `sso` module, which
+   already separates "who is this" from "issue a session".
 7. **Ticket locks are advisory, not exclusive.** The draft asked for
    "concurrency and collision control", and what is built shows who is in a
    thread rather than keeping anyone out of it. A lock that can outlive the

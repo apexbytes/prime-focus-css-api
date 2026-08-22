@@ -7,6 +7,7 @@ import * as auditService from '../audit/audit.service.js';
 import * as customerService from '../customer/customer.service.js';
 import * as messageService from '../message/message.service.js';
 import * as realtimeService from '../realtime/realtime.service.js';
+import * as ssoService from '../sso/sso.service.js';
 import * as ticketService from '../ticket/ticket.service.js';
 import * as webhookService from '../webhook/webhook.service.js';
 import { cutoffsFor, isCoherent, type RetentionCutoffs } from './retention.policy.js';
@@ -44,6 +45,8 @@ export interface SweepResult {
   webhookDeliveriesDeleted: number;
   /** Abandoned ticket locks, cleared in the same pass for the same reason. */
   ticketLocksReleased: number;
+  /** Expired federated sign-in requests, likewise: spent, and not personal data. */
+  ssoLoginRequestsPurged: number;
   /** True when the batch limit was reached, so there is more to do next run. */
   moreRemaining: boolean;
 }
@@ -138,6 +141,7 @@ export async function sweep(
       customersAnonymised: 0,
       webhookDeliveriesDeleted: 0,
       ticketLocksReleased: 0,
+      ssoLoginRequestsPurged: 0,
       moreRemaining: ticketIds.length === limit,
     };
   }
@@ -210,6 +214,9 @@ async function enforce(
     limit,
   );
   const ticketLocksReleased = await realtimeService.sweepExpiredLocks();
+  // A sign-in request expires in minutes, so anything still here is spent. The
+  // cutoff is `now`, not a retention period: there is nothing to keep.
+  const ssoLoginRequestsPurged = await ssoService.purgeLoginRequests(new Date(), limit);
 
   return {
     dryRun: false,
@@ -221,6 +228,7 @@ async function enforce(
     customersAnonymised,
     webhookDeliveriesDeleted,
     ticketLocksReleased,
+    ssoLoginRequestsPurged,
     moreRemaining:
       ticketIds.length === limit ||
       auditLogsDeleted === limit ||

@@ -50,8 +50,10 @@ export interface LoginInput {
  * Enumeration posture: an unknown address and a wrong password are
  * indistinguishable (both generic 401, both paying the same Argon2 cost).
  * Lockout, suspension and not-yet-activated states *are* revealed, but only to a
- * caller who already supplied the correct password — except for invited accounts,
- * which have no password to check and must be told to use their invitation.
+ * caller who already supplied the correct password — except for the two kinds of
+ * account with no password to check at all, which have to be told which way in
+ * to use: one invited and never activated, one activated through an identity
+ * provider.
  */
 export async function login(input: LoginInput): Promise<LoginResult> {
   const email = userService.normaliseEmail(input.email);
@@ -69,16 +71,33 @@ export async function login(input: LoginInput): Promise<LoginResult> {
 
   if (!user.passwordHash) {
     await burnPasswordVerify();
+
+    // Two different accounts have no password hash, and telling them apart is
+    // the difference between a useful message and a support call. An `invited`
+    // one has never been activated; an `active` one was activated through an
+    // identity provider and has no password to be wrong about.
+    const federated = user.status === 'active';
     await repository.recordAttempt({
       ...attemptBase,
       userId: user.id,
-      outcome: 'account_not_activated',
+      outcome: federated ? 'password_unavailable' : 'account_not_activated',
     });
-    throw new AppError(
-      403,
-      ErrorCode.ACCOUNT_NOT_ACTIVATED,
-      'This account has not been activated yet. Use the invitation link sent to your email.',
-    );
+
+    // Both disclose that the address has an account, which is the same
+    // deliberate exception the invited case has always been: there is no
+    // password to check, so no amount of vagueness here buys anything, and a
+    // member of staff has to be told which way in to use.
+    throw federated
+      ? new AppError(
+          403,
+          ErrorCode.SSO_LOGIN_REQUIRED,
+          'This account signs in through an identity provider. Use the sign-in button for your provider, or reset your password to set one.',
+        )
+      : new AppError(
+          403,
+          ErrorCode.ACCOUNT_NOT_ACTIVATED,
+          'This account has not been activated yet. Use the invitation link sent to your email.',
+        );
   }
 
   const passwordOk = await verifyPassword(user.passwordHash, input.password);
@@ -204,11 +223,15 @@ export async function resendOtp(challengeId: string) {
   });
 }
 
-async function completeLogin(user: UserWithRole, action: string): Promise<AuthenticatedResult> {
+async function completeLogin(
+  user: UserWithRole,
+  action: string,
+  after?: Record<string, unknown>,
+): Promise<AuthenticatedResult> {
   const tokens = await issueTokens(user, randomUUID());
   await userService.recordSuccessfulLogin(user.id);
   await auditService.recordSafely(
-    { action, entityType: 'user', entityId: user.id },
+    { action, entityType: 'user', entityId: user.id, ...(after ? { after } : {}) },
     toActor(user, null),
   );
 
@@ -223,6 +246,86 @@ async function completeLogin(user: UserWithRole, action: string): Promise<Authen
 export async function startSessionForActivatedUser(userId: string): Promise<AuthenticatedResult> {
   const user = await userService.requireById(userId);
   return completeLogin(user, 'auth.login_after_invitation');
+}
+
+export interface FederatedSessionInput {
+  userId: string;
+  /** For the audit trail: which provider vouched for this sign-in. */
+  providerCode: string;
+  /** Whether this provider's own authentication still needs the emailed code. */
+  requireOtp: boolean;
+}
+
+/**
+ * Issues a session for a user the `sso` module has already authenticated
+ * against an identity provider.
+ *
+ * Federation is a second way to *prove who somebody is*; everything after that
+ * proof — sessions, refresh families, the audit row, the login-attempt trail —
+ * stays here, so there is exactly one place in this system that mints a staff
+ * session. The account state is re-read rather than trusted from the caller: it
+ * can have been suspended between the redirect to the provider and the code
+ * coming back.
+ *
+ * No emailed code by default. The provider is the authentication authority, and
+ * mailing a one-time code to an address that provider has just proved control of
+ * is friction pretending to be a factor. A provider whose own MFA cannot be
+ * relied on is configured with `requireOtp`, and then the response is the same
+ * `otp_required` challenge the password flow issues — which is why the console
+ * needs no new branch for it.
+ */
+export async function startFederatedSession(input: FederatedSessionInput): Promise<LoginResult> {
+  const user = await userService.requireById(input.userId);
+  const context = getContext();
+
+  if (user.status !== 'active') {
+    throw new AppError(403, ErrorCode.ACCOUNT_SUSPENDED, 'This account is not active');
+  }
+
+  await repository.recordAttempt({
+    email: user.email,
+    userId: user.id,
+    outcome: 'sso_ok',
+    ip: context?.ip,
+    userAgent: context?.userAgent,
+  });
+
+  if (input.requireOtp) {
+    const challenge = await mfaService.issueLoginChallenge({
+      id: user.id,
+      email: user.email,
+      fullName: user.fullName,
+    });
+
+    return {
+      status: 'otp_required',
+      challengeId: challenge.challengeId,
+      expiresAt: challenge.expiresAt,
+      codeLength: env.OTP_LENGTH,
+      emailDelivered: challenge.emailDelivered,
+    };
+  }
+
+  return completeLogin(user, 'auth.login_sso', { provider: input.providerCode });
+}
+
+/**
+ * Records a federated sign-in that was refused before any session existed — an
+ * address with no account, or one a provider is not allowed to vouch for.
+ *
+ * In `login_attempts` rather than only in the log, because that table is what an
+ * investigator reads to see somebody working through a list of addresses, and a
+ * refusal that leaves no row makes federation the blind spot in it.
+ */
+export async function recordFederatedDenial(email: string, userId?: string): Promise<void> {
+  const context = getContext();
+  await repository.recordAttempt({
+    email: userService.normaliseEmail(email),
+    ...(userId ? { userId } : {}),
+    outcome: 'sso_denied',
+    ip: context?.ip,
+    userAgent: context?.userAgent,
+  });
 }
 
 // -- tokens -------------------------------------------------------------------

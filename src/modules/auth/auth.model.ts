@@ -67,6 +67,15 @@ export const loginOutcome = pgEnum('login_outcome', [
   'otp_expired',
   'otp_ok',
   'device_trusted',
+  /**
+   * Federated sign-in, added in Phase 7. `password_unavailable` is its
+   * counterpart on the password endpoint: an account activated through a
+   * provider has no password to check, which is a fact about the account rather
+   * than a failed guess.
+   */
+  'sso_ok',
+  'sso_denied',
+  'password_unavailable',
 ]);
 
 export const loginAttempts = pgTable(

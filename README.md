@@ -87,6 +87,68 @@ they should hold. They receive a link, choose a password at
 Seeded roles: `super_admin`, `admin`, `tier2_specialist`, `tier1_agent`. Only
 `super_admin` can change what a role may do.
 
+### Through an identity provider
+
+Staff can also sign in through Google, Microsoft Entra or any OpenID Connect
+provider. Providers are configured, not compiled in:
+
+```bash
+# perm sso:manage. The client secret goes in and is never returned again.
+curl -X POST localhost:3000/api/v1/identity-providers \
+  -H "authorization: Bearer $TOKEN" -H 'content-type: application/json' \
+  -d '{"code":"google","displayName":"Google","kind":"google",
+       "issuer":"https://accounts.google.com",
+       "clientId":"…","clientSecret":"…",
+       "allowedEmailDomains":["primefocus.co.zw"]}'
+```
+
+`allowedEmailDomains` is required and may not be empty: `accounts.google.com` is
+the issuer for every consumer Google account on earth, so "no domains" must not
+mean "any domain". For a Microsoft provider, add `"requireVerifiedEmail": false` —
+Entra does not emit the `email_verified` claim at all, and that has to be an
+administrator's decision rather than a default.
+
+The flow is three calls, and the provider redirects to the **console** rather than
+to the API, so no session token ever travels in a URL:
+
+```bash
+# 1. the sign-in screen asks what buttons to draw (public)
+curl localhost:3000/api/v1/auth/sso/providers
+
+# 2. start one. The browser goes to authorizationUrl; state, nonce and the PKCE
+#    challenge are already in it.
+curl -sX POST localhost:3000/api/v1/auth/sso/start -H 'content-type: application/json' \
+  -d '{"providerCode":"google","returnPath":"/tickets"}'
+
+# 3. the provider sends the browser to APP_WEB_URL/auth/sso/callback?code=…&state=…
+#    and the console posts both here, getting the ordinary token pair back
+curl -sX POST localhost:3000/api/v1/auth/sso/callback -H 'content-type: application/json' \
+  -d '{"state":"…","code":"…"}'
+```
+
+Register `SSO_REDIRECT_URL` (by default `APP_WEB_URL/auth/sso/callback`) with the
+provider, exactly as written.
+
+**No account is created by signing in.** A provider says who somebody is, not
+that they work here, so invitation is still the only way an account comes into
+existence — but an invited colleague who signs in through a provider is activated
+on the spot with no password to choose, and their invitation link stops working.
+Such an account has no password, so `POST /auth/login` answers
+`SSO_LOGIN_REQUIRED` and points them at the button; a password reset still works,
+because a provider outage must not lock the desk out.
+
+```bash
+# my own links, and unlinking one — refused if it is the only way in
+curl localhost:3000/api/v1/auth/sso/identities -H "authorization: Bearer $TOKEN"
+curl -X DELETE localhost:3000/api/v1/auth/sso/identities/$ID -H "authorization: Bearer $TOKEN"
+```
+
+Links are keyed on the provider's `sub`, never on the email address: a reassigned
+mailbox must not inherit the previous holder's tickets. A _new_ subject arriving
+with an already-linked address is a 409, not a silent relink. And a provider
+cannot be deleted while anybody signs in through it — `PATCH { "isActive": false }`
+is the reversible way to stop offering it.
+
 ## Ticketing
 
 Every ticket belongs to exactly one product, and **agents only see the products they are
@@ -523,7 +585,10 @@ Two more rules worth knowing before writing code:
 
 - `process.env` is read only in `src/config/env.ts`. Everything else imports `env`.
 - Nothing presented as a bearer credential is stored in the clear. Passwords are Argon2id;
-  refresh tokens, device tokens, invitation and reset tokens, API keys and login codes are
-  stored as keyed HMAC digests.
+  refresh tokens, device tokens, invitation and reset tokens, API keys, login codes and SSO
+  `state` values are stored as keyed HMAC digests. The two exceptions are the values this
+  API presents to somebody else rather than verifies — a webhook subscription's signing
+  secret and an identity provider's client secret — and both are write-only through the
+  API.
 - Customer PII and credentials never go into logs. `src/lib/logger/redact.ts` is
   the safety net, not the strategy — log IDs and reference codes.

@@ -294,6 +294,36 @@ export const envSchema = z.object({
    */
   WEBHOOK_DELIVERY_RETENTION_DAYS: z.coerce.number().int().min(1).max(365).default(30),
 
+  // ---- federated sign-in (SSO) ---------------------------------------------
+  /**
+   * Where the identity provider sends the browser back. It is the **console's**
+   * callback route, not an API route: the console reads `code` and `state` out
+   * of its own URL and posts them to `/auth/sso/callback`, which keeps the
+   * session tokens out of a URL the way every other credential in this system
+   * is kept out of one. Derived from `APP_WEB_URL` unless set.
+   */
+  SSO_REDIRECT_URL: z.string().min(1).optional(),
+  /**
+   * How long a started sign-in stays completable. Ten minutes: long enough for
+   * a password manager and a second factor at the provider, short enough that a
+   * `state` captured from a browser's history is useless.
+   */
+  SSO_LOGIN_REQUEST_TTL_MINUTES: z.coerce.number().int().min(1).max(60).default(10),
+  /**
+   * How long a provider's OpenID discovery document is reused. An hour: these
+   * change when a provider rotates an endpoint, which is rare, and the signing
+   * keys behind it are fetched and cached separately by their own `kid`.
+   */
+  SSO_DISCOVERY_CACHE_SECONDS: z.coerce.number().int().min(0).max(86_400).default(3_600),
+  /** Budget for one call to a provider's discovery, JWKS or token endpoint. */
+  SSO_HTTP_TIMEOUT_MS: z.coerce.number().int().min(1_000).max(30_000).default(8_000),
+  /**
+   * Allows an `http` or loopback issuer, which is what the test suite's own
+   * provider is. Refused in production: an issuer reachable over plain HTTP is
+   * an identity provider anyone on the path can impersonate.
+   */
+  SSO_ALLOW_INSECURE_ISSUER: booleanish.default(false),
+
   // ---- seed ----------------------------------------------------------------
   SEED_ADMIN_EMAIL: z.string().min(3).default('admin@primefocus.co.zw'),
   SEED_ADMIN_NAME: z.string().min(1).default('Prime Focus Administrator'),
@@ -368,6 +398,17 @@ const productionSchema = envSchema.superRefine((value, ctx) => {
       path: ['REDIS_URL'],
       message:
         'is required in production (or set CACHE_DRIVER=memory to run a single instance deliberately)',
+    });
+  }
+
+  // An issuer reachable over plain HTTP, or on a host only this process can
+  // reach, is an identity provider that can be impersonated by anyone on the
+  // path — and it authenticates staff into a support desk.
+  if (value.SSO_ALLOW_INSECURE_ISSUER) {
+    ctx.addIssue({
+      code: 'custom',
+      path: ['SSO_ALLOW_INSECURE_ISSUER'],
+      message: 'cannot be enabled in production; an identity provider must be reachable over https',
     });
   }
 
@@ -448,3 +489,13 @@ export const storageBackend: 'local' | 's3' =
   (env.STORAGE_BUCKET && env.STORAGE_ACCESS_KEY_ID && env.STORAGE_SECRET_ACCESS_KEY
     ? 's3'
     : 'local');
+
+/**
+ * The console route the provider redirects back to, derived from `APP_WEB_URL`
+ * unless overridden. It is registered with the provider and sent again on the
+ * token exchange, where the provider checks the two match — so this value and
+ * the one in the provider's console have to agree exactly, trailing slash
+ * included, which is why it is normalised here rather than at each call site.
+ */
+export const ssoRedirectUrl: string =
+  env.SSO_REDIRECT_URL ?? `${env.APP_WEB_URL.replace(/\/+$/, '')}/auth/sso/callback`;
