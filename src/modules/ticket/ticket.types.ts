@@ -11,7 +11,8 @@ export interface TicketSummary {
   productName: string;
   customerId: string;
   customerName: string;
-  customerEmail: string;
+  /** Null for a customer who has only ever reached the desk on a channel. */
+  customerEmail: string | null;
   categoryId: string | null;
   categoryName: string | null;
   assignedToUserId: string | null;

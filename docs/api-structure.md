@@ -81,7 +81,8 @@ prime-focus-css/
 │   │   ├── antivirus/                # clamd over TCP, or a `none` driver
 │   │   ├── redis/                    # connection, duplicates for pub/sub, health
 │   │   ├── cache/                    # TTL store + cross-instance invalidation signals
-│   │   └── socket/                   # socket.io server, redis adapter, broadcast
+│   │   ├── socket/                   # socket.io server, namespaces, redis adapter
+│   │   └── whatsapp/                 # Cloud API send + inbound signature verify
 │   │
 │   ├── modules/                      # one folder per entity — see §3
 │   │   ├── auth/
@@ -111,6 +112,8 @@ prime-focus-css/
 │   │   ├── api-key/
 │   │   ├── event/                    # domain event fan-out: realtime + webhooks
 │   │   ├── realtime/                 # ticket locks, typing, live queue counts
+│   │   ├── conversation/             # channel threads, inbound filing, reply dispatch
+│   │   ├── chat/                     # the live-chat visitor: sessions, namespace
 │   │   ├── webhook/
 │   │   └── health/
 │   │
@@ -240,6 +243,8 @@ Grouped by domain; each is a folder in `src/modules/`.
 - **webhook** — outbound subscriptions so other Prime Focus systems can react to ticket events; HMAC-signed over `timestamp.body`, retried with backoff, delivery log, and a subscription that fails often enough switches itself off. The signing secret is returned once at creation and stored in the clear, because signing is not verifying — see §8.
 - **event** — the one place a domain event is announced. Owns no table and has no router: it turns a ticket change into the envelope both the websocket fan-out and the webhook fan-out consume, so a service that changes a ticket tells them in one call rather than two. In `modules/` rather than `common/` because it reaches two other modules' services.
 - **realtime** — the websocket side of the console: `ticket_locks` (advisory, expiring), typing indicators, live per-product queue counts, and a push of each in-app notification. Every one of them is also reachable over REST, so a browser behind a proxy that strips upgrades is slower rather than broken.
+- **conversation** — the channel-agnostic core of Phase 8. Owns the long-lived thread a customer has with the desk on one channel (`channel_conversations`), the identity they are known by there (`customer_channel_identities`), the durable inbound and outbound envelopes, the filing pipeline that turns a message into a ticket or appends it to one, and `dispatchReply` — the one place that decides which transport an agent's public reply leaves on. It also owns the inbound WhatsApp webhook, because WhatsApp is one channel feeding this pipeline rather than a module of its own; `lib/whatsapp/` is the transport underneath it. **No channel-specific logic in the pipeline**: an adapter reduces whatever a provider sends to one normalised shape, and `file()` has never heard of WhatsApp.
+- **chat** — the customer-facing half of live chat, and the only surface in the system whose caller is a member of the public. Issues a session token that authorises exactly one conversation, serves that conversation over both a Socket.IO namespace of its own and an equivalent set of REST calls, and refuses a staff credential as firmly as the staff namespace refuses a visitor's. It holds no ticket logic: a visitor's message goes through `conversation`'s pipeline like any other inbound message.
 - **audit** — append-only trail of every state change (actor, action, entity, before/after, IP, UA). Written inside the same transaction as the change. Read-only API for admins.
 - **report** — FRT, resolution time, SLA compliance, volume by product/channel/category, agent throughput, CSAT, knowledge base usage. Served from six materialised views refreshed every fifteen minutes, not from live ticket scans; the one exception is the open backlog, which is a level rather than a flow and is counted live off an index. Every response carries how stale it is.
 - **retention** — the scheduled enforcement of the Cyber and Data Protection Act periods. Its own module rather than part of `audit`, because the sweep spans audit rows, message bodies, attachments and customer records: it owns none of that data and orchestrates through those modules' services. `POST /retention/sweep` dry-runs by default.
@@ -334,6 +339,56 @@ cookie and no session for somebody who has not signed in yet. The row is consume
 by the completion, which is what makes one authorization code redeemable once on
 our side as well as the provider's.
 
+**Omnichannel channels** — built in Phase 8
+`customer_channel_identities`, `channel_conversations`,
+`inbound_channel_messages`, `outbound_channel_messages`, `chat_sessions`, plus
+`chat` and `whatsapp` on the `ticket_channel` enum — which the enum's own comment
+predicted: a new adapter and a new value, no change to `tickets`.
+
+`customers.email` **became nullable**, and it is the one schema change in this
+phase worth arguing at length. A customer who first reaches the desk over
+WhatsApp has a phone number, and a chat visitor has a browser session; neither
+has an address. Both alternatives were worse. Synthesising
+`263771234567@whatsapp.invalid` puts a fake value in the field every outbound
+email path reads, so a CSAT survey would be posted into a black hole forever and
+nothing would say so. Refusing to record the customer leaves a conversation with
+nobody on it. Postgres treats NULLs as distinct, so the unique constraint still
+holds exactly what it held before — at most one customer per address — and every
+send path now asks whether there is one. `survey.dispatch` answers
+`skipped: customer has no email address` rather than sending.
+
+`customer_channel_identities` is unique on `(channel, identifier)`, and lives in
+`conversation` rather than on `customers` for the reason `sso_identities` lives
+in `sso`: it is a fact about a relationship with an outside system, there is more
+than one per person, and it is revoked on that system's schedule. It is what
+makes the second message from a number reach the same customer as the first, and
+what a customer merge has to move — otherwise the merge silently undoes itself
+the next time that number writes.
+
+`channel_conversations` is unique on `(channel, external_id)` and **long-lived
+rather than per-ticket**, because that is what the channels themselves are: a
+WhatsApp thread with a number is the same thread forever and the customer sees
+one scrollback whatever the desk opened and closed behind it. `ticket_id` points
+at whichever ticket is currently receiving messages and is null between them. The
+alternative — a row per ticket — makes "which thread is this message on" a
+most-recent-open query with a race in it, and leaves nowhere to keep
+`window_expires_at`, which belongs to the thread and to no ticket in it.
+
+`inbound_channel_messages` is unique on `provider_message_id`, which is the
+deduplication: Meta redelivers any webhook it did not get a prompt 2xx for, and a
+redelivery must not become a second message in the customer's thread.
+`outbound_channel_messages` matters more than its email counterpart, because a
+WhatsApp reply refused for being outside the window looks identical to a
+delivered one from the console — this is the row that says it never arrived, and
+the thread gets a system note saying so too.
+
+`chat_sessions` holds the visitor's credential as a digest, like every other
+bearer value presented to this API. Not a JWT: a signed token is unrevocable for
+its lifetime, and the whole reason this is a row is that the desk must be able to
+end one conversation without waiting out an expiry. It carries no scope and no
+role — the `conversation_id` on the row _is_ the authorisation, because there is
+nothing else it could ever be allowed to do.
+
 **Platform**
 `notifications`, `notification_preferences`, `outbound_emails`,
 `email_events`, `webhook_subscriptions`, `webhook_deliveries`, `audit_logs`,
@@ -358,6 +413,15 @@ our side as well as the provider's.
 - `ticket_locks (socket_id)` — releasing everything a dropped connection held
 - `sso_login_requests (state_hash)` unique — the completion's only lookup, and the
   replay guard: the `consumed_at is null` predicate lives in the same statement
+- `channel_conversations (channel, external_id)` unique — how every inbound
+  message finds its thread, and the tie-break when two arrive at once
+- `customer_channel_identities (channel, identifier)` unique — the same job for
+  the customer behind it
+- `inbound_channel_messages (provider_message_id)` unique — the redelivery guard
+- `inbound_channel_messages (status, received_at)` — the operator backlog's only
+  query
+- `chat_sessions (token_hash)` unique — the lookup on every visitor frame; the
+  liveness predicate lives in the same statement, as it does for `sso_login_requests`
 
 **Key state machine** — enforced in `ticket.service.ts`, not the DB:
 transitions are whitelisted, each one writes an `audit_log` row and emits a
@@ -497,6 +561,32 @@ GET|PATCH|DELETE /webhook-subscriptions/:id
 GET    /webhook-subscriptions/:id/deliveries
 POST   /webhook-deliveries/:id/redeliver   (re-sends the stored payload verbatim)
 
+GET    /conversations?channel=&status=&productId=&cursor=   (perm channel:read)
+GET    /conversations/inbound/unprocessed                  (perm channel:manage)
+POST   /conversations/inbound/:id/reprocess                (perm channel:manage)
+
+GET    /webhooks/whatsapp         (Meta's URL verification: answers with the bare
+                                   `hub.challenge` string, not the response
+                                   envelope, because Meta compares bytes)
+POST   /webhooks/whatsapp         (X-Hub-Signature-256 over the raw body,
+                                   unauthenticated, mounted ahead of the rate
+                                   limiter — WhatsApp arrives in bursts and Meta
+                                   redelivers anything not promptly 2xx'd)
+
+# Live chat. Mounted at /api/v1/chat, ahead of the versioned router and outside
+# `authenticate` entirely: the caller is a member of the public, and the session
+# token must never be resolved into an `Actor`. Inside the rate limiters, unlike
+# the provider webhooks — an anonymous endpoint that creates rows is the one
+# thing here worth flooding.
+GET    /chat/config              (is chat on, and where to connect)
+POST   /chat/sessions            { productCode?, displayName?, contactEmail?, page? }
+                                 → { sessionToken, conversationExternalId, expiresAt, … }
+POST   /chat/messages            { body }        (Authorization: Bearer <sessionToken>)
+GET    /chat/transcript          (public messages only — internal notes are
+                                  excluded by the message module, not by a filter
+                                  in the chat controller)
+DELETE /chat/session             (the visitor closes the conversation)
+
 POST   /webhooks/resend/inbound   (Svix-signed, unauthenticated, mounted ahead of
                                    the rate limiter so a spike of customer email
                                    is never throttled)
@@ -555,6 +645,32 @@ Every client event answers through a callback (`{ ok: true, data }` or
 Each subscription is access-checked by the module that owns the resource, so a
 room is never a way around product scoping.
 
+**The live-chat namespace** (`CHAT_NAMESPACE`, default `/chat`) is a second
+protocol on the same server, and everything about it is narrower — each narrowing
+being the point rather than an omission:
+
+```
+client → chat:send       { body }        → ack: { ticketId, created }
+client → chat:typing     { isTyping }
+client → chat:transcript                 → ack: the public thread
+client → chat:end
+server → chat:message    { conversationId, author, body, createdAt }
+server → chat:typing     { author, isTyping }
+server → chat:ended      { reason }
+```
+
+- **No subscribe event.** The server joins a visitor to their own conversation's
+  room at connection time. There is no client event that takes a room name, so
+  there is nothing to pass another conversation's id to.
+- **No ticket id anywhere in the protocol.** The credential resolves to a
+  conversation and the conversation names the ticket. A widget that could name a
+  ticket would be a widget that could try naming somebody else's.
+- **No lock, no queue counts, no notifications** — those are the desk's internal
+  state, and there is no code path from here to them.
+- **A separate namespace**, so none of the above is one forgotten check away from
+  being reachable. A staff token is refused here and a visitor token is refused
+  on the staff namespace; each handshake reads only the credential it accepts.
+
 ---
 
 ## 6. Cross-cutting rules
@@ -612,20 +728,30 @@ room is never a way around product scoping.
 
 ## 7. Async jobs (`pg-boss`)
 
-| Job                     | Trigger                      | Owner module | Built   |
-| ----------------------- | ---------------------------- | ------------ | ------- |
-| `ticket.triage`         | ticket created               | routing      | Phase 4 |
-| `ticket.autoassign`     | after triage                 | routing      | Phase 4 |
-| `sla.scan`              | cron, every minute           | sla          | Phase 4 |
-| `sla.escalate`          | from scan                    | escalation   | Phase 4 |
-| `email.send`            | queued on notification/reply | email        | inline  |
-| `email.inbound.process` | Resend inbound webhook       | email        | inline  |
-| `survey.dispatch`       | ticket resolved + delay      | survey       | Phase 5 |
-| `attachment.scan`       | upload confirmed             | attachment   | Phase 5 |
-| `report.refresh`        | cron, every 15 min           | report       | Phase 5 |
-| `notification.digest`   | cron, daily 07:00 CAT        | notification | Phase 5 |
-| `retention.sweep`       | cron, weekly                 | retention    | Phase 5 |
-| `webhook.deliver`       | domain event                 | webhook      | Phase 6 |
+| Job                       | Trigger                      | Owner module | Built   |
+| ------------------------- | ---------------------------- | ------------ | ------- |
+| `ticket.triage`           | ticket created               | routing      | Phase 4 |
+| `ticket.autoassign`       | after triage                 | routing      | Phase 4 |
+| `sla.scan`                | cron, every minute           | sla          | Phase 4 |
+| `sla.escalate`            | from scan                    | escalation   | Phase 4 |
+| `email.send`              | queued on notification/reply | email        | inline  |
+| `email.inbound.process`   | Resend inbound webhook       | email        | inline  |
+| `survey.dispatch`         | ticket resolved + delay      | survey       | Phase 5 |
+| `attachment.scan`         | upload confirmed             | attachment   | Phase 5 |
+| `report.refresh`          | cron, every 15 min           | report       | Phase 5 |
+| `notification.digest`     | cron, daily 07:00 CAT        | notification | Phase 5 |
+| `retention.sweep`         | cron, weekly                 | retention    | Phase 5 |
+| `webhook.deliver`         | domain event                 | webhook      | Phase 6 |
+| `channel.inbound.process` | WhatsApp webhook             | conversation | Phase 8 |
+| `conversation.sweep`      | cron, hourly                 | conversation | Phase 8 |
+
+`channel.inbound.process` is queued from the first day of its channels, unlike
+the email pipeline below: there was no verified inline behaviour to re-prove, and
+a WhatsApp message lost to a restart is a customer who was ignored. Live chat is
+the one exception in the other direction — a visitor's message is filed **in the
+request**, because they are watching a spinner, and the durable inbound row is
+still written first so a crash mid-file leaves exactly what the queued path would
+have left.
 
 `email.send` and `email.inbound.process` are marked _inline_: they exist and work,
 but they still run in the request that causes them rather than as queued jobs.
@@ -1151,6 +1277,118 @@ Decisions worth knowing:
   about, and dropped by the pass that already runs weekly with permission to
   delete things.
 
+**Phase 8 — omnichannel channels** — _complete_
+`lib/whatsapp` and two modules: `conversation`, the channel-agnostic thread and
+filing core, and `chat`, the live-chat visitor's own surface. 5 more tables, 2
+more permissions, 9 more endpoints, a second Socket.IO namespace, and the first
+time a customer can reach this desk without an email address.
+
+Verified end to end against both real ingresses. The WhatsApp cases sign their
+own webhook the way Meta does and the live-chat cases drive a real Socket.IO
+client against a real HTTP server: a message from a number nobody has seen opens
+a ticket for a customer with no address at all; a second message from that number
+joins the same ticket rather than making a second customer; a webhook whose
+signature does not match is refused before anything is recorded; a redelivery is
+a no-op; a photo is recorded as unreadable rather than dropped; an agent's public
+reply goes out over WhatsApp and not by email, while an internal note goes
+nowhere at all; a reply past the 24-hour window is refused with the reason
+written into the thread; a chat visitor's first message opens a ticket and the
+agent's answer arrives on their socket without being asked for; a visitor's
+transcript has the internal notes stripped out; and a visitor token is refused on
+the staff namespace exactly as a staff token is refused on the chat one.
+
+Decisions worth knowing:
+
+- **The whole phase turns on one function.** Until now `message.service` ended a
+  public reply by calling the email service, which made "reply to the customer"
+  and "send an email" the same statement. It now calls
+  `conversation.dispatchReply`, which picks the transport from the ticket's
+  channel. The visibility branch it hangs off — the most consequential line in
+  the system — was deliberately not touched, and the test that an internal note
+  produces no outbound anything is asserted per channel.
+- **VoIP is still not built, and `phone` is still not on the enum.** The channel
+  abstraction was always the claim; this phase spends it twice and leaves the
+  third case honestly open. A voice channel is not another text adapter — it
+  needs a recording store, a transcription step and a retention argument of its
+  own — and adding the enum value without them would be schema pretending to be
+  a feature.
+- **A conversation is a thread, not a ticket.** Long-lived and keyed on the
+  channel's own id, with a ticket pointer that the idle sweep detaches after a
+  week. So a customer replying after a weekend joins the ticket they were talking
+  about, and "I have another problem" next month opens new work instead of
+  reopening something finished. Email is unchanged here: it threads by
+  `Message-ID` and always did.
+- **`customers.email` is nullable now**, argued at length in §4. The short
+  version: the two alternatives were a fake address in the field every send path
+  reads, or refusing to record a customer who is talking to us.
+- **A chat visitor is not an `Actor`, and the type is the enforcement.** Every
+  authorisation check in this codebase takes an `Actor`; making a visitor one
+  would mean every one of those checks learning about a kind with no permissions.
+  So `ChatVisitor` is its own type, resolved by exactly one controller, and
+  `authenticate` is never in the chat router's path.
+- **The chat widget gets its own namespace rather than rooms on the staff
+  connection.** Rooms would make the isolation a check somebody has to remember
+  at every emit; a namespace makes it structural — there is no code path on which
+  a visitor's socket can be sent a staff event or join a staff room. Refactoring
+  `lib/socket` to support namespaces is the cost, and it was the right one.
+- **Meta's 24-hour window is the ugliest fact in the phase and is not hidden.**
+  Outside it a free-form reply is refused by the provider, so the window is
+  stored on the thread, checked before the send, and the refusal is written into
+  the ticket as a system note — because in the console a refused reply looks
+  exactly like a delivered one. An approved template re-opens the conversation
+  when one is configured; when none is, the agent is told rather than having a
+  template invented for them.
+- **A self-declared email in the chat widget links nothing.** Anyone can type
+  anybody's address, and matching on it would hand a stranger the thread history
+  of whoever owns that mailbox. It is recorded on the session as contact detail
+  for the agent, and the customer record stays separate until a human merges it —
+  the same ordering, and the same account-takeover path, that the `sso` module
+  refuses to open.
+- **One number, one widget, so configuration decides the product.** Inbound email
+  knows its product from the address it was written to; a WhatsApp message knows
+  nothing. `WHATSAPP_PRODUCT_CODE` is where it lands and routing rules move it
+  from there. With nothing configured the filing fails loudly and the message
+  waits in the backlog, for the reason the email path gives: guessing files a
+  customer's query where the agents who could act on it will never look.
+- **`POST /tickets` still refuses `email`, and now refuses `chat` and `whatsapp`
+  too.** Each of those channels implies a live thread on the other side — a
+  `Message-ID` to reply against, a conversation row to send down — so an API
+  caller claiming one would be claiming a conversation that does not exist, and
+  the reply would have nowhere to go.
+- **Delivery receipts are parsed and dropped.** The branch exists so a status
+  envelope is not mistaken for an empty message envelope, but nothing is stored:
+  this system does not show a customer's read state to agents, and a row per
+  receipt on a busy number is a large table nobody reads.
+- **Media is recorded, not fetched.** A photo of a failed ATM screen is exactly
+  the attachment an agent wants, and downloading it means Meta's media endpoint,
+  the object store, the virus scanner and a retention rule — four things, not
+  one. Until then the message is filed as `ignored` with `no readable body`,
+  which is visible in the operator backlog rather than silently absent.
+- **CSAT is skipped, not adapted.** The survey is an email with a tokenised link;
+  asking for a score over WhatsApp needs an approved template and a way to read a
+  digit back as a rating. `dispatch` answers `skipped` with a reason, because
+  response rate is itself a reported number and a send that quietly fails would
+  corrupt it.
+- **A visitor's rate limit lives in the service, not in middleware.** A socket
+  frame never passes through an Express limiter, so without it one visitor could
+  write a thousand messages into a ticket. It is counted through the shared cache
+  — per session across instances with Redis, per instance without, the same
+  honest degradation the rest of that layer documents.
+- **An abandoned widget is reaped rather than left.** Opening the chat panel
+  creates a customer, an identity and a thread before a word is typed, because
+  the session has to authorise _something_. A visitor who then closes the tab
+  would otherwise leave all three until the five-year dormant-customer pass
+  noticed them, which on a busy site is years of accumulating rows with nothing
+  in them. So the hourly sweep deletes chat threads that never became a ticket,
+  past twice the session TTL, and offers the customer ids to the `customer`
+  module — which re-checks every condition itself, because it owns that table and
+  this is a delete rather than an anonymisation. Only `chat`: a WhatsApp
+  identity is how a returning customer is recognised and has to outlive any one
+  conversation.
+- **Neither channel fails readiness.** An unreachable Meta is somebody else's
+  outage, and the argument is Phase 7's about an identity provider: an instance
+  whose WhatsApp is down still serves every ticket in the system.
+
 ---
 
 ## 9. Environment
@@ -1181,10 +1419,24 @@ WEBHOOK_TIMEOUT_MS, WEBHOOK_MAX_ATTEMPTS, WEBHOOK_DISABLE_AFTER_FAILURES,
 WEBHOOK_DELIVERY_RETENTION_DAYS
 SSO_REDIRECT_URL, SSO_LOGIN_REQUEST_TTL_MINUTES, SSO_DISCOVERY_CACHE_SECONDS,
 SSO_HTTP_TIMEOUT_MS, SSO_ALLOW_INSECURE_ISSUER
+WHATSAPP_APP_SECRET, WHATSAPP_PHONE_NUMBER_ID, WHATSAPP_ACCESS_TOKEN,
+WHATSAPP_VERIFY_TOKEN, WHATSAPP_API_BASE_URL, WHATSAPP_HTTP_TIMEOUT_MS,
+WHATSAPP_TRANSPORT, WHATSAPP_PRODUCT_CODE, WHATSAPP_SERVICE_WINDOW_HOURS,
+WHATSAPP_REOPEN_TEMPLATE, WHATSAPP_REOPEN_TEMPLATE_LANGUAGE
+CHAT_ENABLED, CHAT_NAMESPACE, CHAT_SESSION_TTL_MINUTES, CHAT_PRODUCT_CODE,
+CHAT_MESSAGE_RATE_PER_MINUTE
+CONVERSATION_IDLE_HOURS, CONVERSATION_SWEEP_CRON
 RATE_LIMIT_WINDOW, RATE_LIMIT_MAX
 API_KEY_RATE_LIMIT_WINDOW_MS, API_KEY_RATE_LIMIT_MAX
 DEFAULT_TIMEZONE=Africa/Harare
 ```
+
+WhatsApp _is_ here, and identity providers are not — which looks inconsistent
+and is not. A provider is a decision about who may become a signed-in member of
+staff, taken per partner, and belongs to an administrator with an audit row. The
+Cloud API credentials are one business's own account on one platform: there is
+exactly one of them, nobody adds a second at runtime, and an approved message
+template is versioned in Meta's console rather than here.
 
 Identity providers themselves are **not** here: issuer, client credentials and
 the email domains each may vouch for are rows, configured through
@@ -1229,6 +1481,13 @@ or malformed — never `process.env.X` anywhere else in the codebase.
   assert that our own code was called and prove nothing about the signature,
   audience, issuer, nonce or PKCE checks — which are the parts that are either
   right or a way in.
+- **Omnichannel** — both channels through their real ingress. The WhatsApp cases
+  compute a genuine `X-Hub-Signature-256` over the exact bytes they send, so the
+  signature check is the thing under test rather than a mock of it; the live-chat
+  cases open real Socket.IO clients against a real HTTP server, including the two
+  refusals that matter — a visitor token on the staff namespace and a staff token
+  on the chat one. A stubbed ingress would assert that our own code was called
+  and prove nothing about either.
 - **Authorisation matrix** — a table-driven test asserting each role × endpoint
   outcome. This is the one suite that must never be skipped: RBAC regressions
   in a fintech leak customer financial data.
@@ -1250,10 +1509,23 @@ Called out so the trade-offs are explicit, not silently dropped:
    auto-categorisation would arrive as further criteria feeding the same
    `RoutingDecision` that `routing.scoring.ts` already produces — the seam is
    there, the model is not.
-3. **VoIP and social channels deferred.** The channel abstraction (`channel`
-   enum + `source_metadata jsonb` + one adapter per channel in `lib/`) is in
-   from day one; only email, web form, and product-system API are implemented.
-   Adding WhatsApp is a new adapter, not a schema change.
+3. **VoIP still deferred; WhatsApp and live chat are built.** The claim was that
+   the channel abstraction (`channel` enum + `source_metadata jsonb` + one
+   adapter per channel in `lib/`) would make a new channel an adapter rather than
+   a schema change, and Phase 8 spent that claim twice: `lib/whatsapp` plus the
+   `conversation` pipeline, and a second Socket.IO namespace for the widget. It
+   held, with one exception worth admitting — `customers.email` had to become
+   nullable, because the abstraction covered how a message arrives and not the
+   fact that some channels carry no address at all (§4).
+
+   VoIP is still out, and deliberately rather than by omission: a voice channel
+   is not another text adapter. It needs a recording store, a transcription step
+   and a retention argument of its own, and adding `phone` to the enum without
+   them would be schema pretending to be a feature. Two smaller gaps inside the
+   channels that _are_ built, stated rather than hidden: inbound media is
+   recorded as unreadable rather than downloaded, and CSAT is skipped for a
+   customer with no address instead of being asked over the channel.
+
 4. **Data lake → materialised views.** Real-time dashboards come from Postgres
    materialised views refreshed on a schedule, as built in Phase 5: six views,
    rebuilt every fifteen minutes, with every response stamped with how stale it

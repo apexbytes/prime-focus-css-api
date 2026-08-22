@@ -34,11 +34,26 @@ export const ticketStatus = pgEnum('ticket_status', [
 export const ticketPriority = pgEnum('ticket_priority', ['low', 'normal', 'high', 'urgent']);
 
 /**
- * How the ticket arrived. `phone` and social channels are deliberately absent
- * until there is an adapter for them; adding one is a new enum value, not a
- * schema change.
+ * How the ticket arrived, and — for the channels a customer can reply on — the
+ * transport an agent's public reply goes back out over. See
+ * `conversation.service.dispatchReply`.
+ *
+ * `chat` and `whatsapp` arrived with Phase 8, exactly as this comment predicted:
+ * a new adapter and a new enum value, no schema change to `tickets`. `phone`
+ * (VoIP) is still absent because there is still no adapter for it.
+ *
+ * `agent`, `api` and `web_form` are *origins* rather than transports: nobody is
+ * waiting on the other end of them, so a reply on one of those tickets goes out
+ * by email to the address on the customer record.
  */
-export const ticketChannel = pgEnum('ticket_channel', ['email', 'web_form', 'api', 'agent']);
+export const ticketChannel = pgEnum('ticket_channel', [
+  'email',
+  'web_form',
+  'api',
+  'agent',
+  'chat',
+  'whatsapp',
+]);
 
 /**
  * Human-facing reference numbers come from a sequence rather than a count, so

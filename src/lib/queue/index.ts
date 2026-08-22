@@ -19,6 +19,14 @@ export const JOB = {
   notificationDigest: 'notification.digest',
   retentionSweep: 'retention.sweep',
   webhookDeliver: 'webhook.deliver',
+  /**
+   * Files an inbound WhatsApp or live-chat message onto a ticket. Queued from
+   * the first day of those channels, unlike `email.inbound.process` which is
+   * still inline — there was no verified inline behaviour here to preserve.
+   */
+  channelInboundProcess: 'channel.inbound.process',
+  /** Detaches conversation threads nobody has written on for a week. */
+  conversationSweep: 'conversation.sweep',
 } as const;
 
 export type JobName = (typeof JOB)[keyof typeof JOB];

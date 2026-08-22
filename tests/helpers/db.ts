@@ -5,6 +5,7 @@ import { seedPermissions, seedRoles } from '../../src/db/seeds/identity.js';
 import { seedServiceLevels } from '../../src/db/seeds/service-levels.js';
 import { clearMemoryCache } from '../../src/lib/cache/index.js';
 import { clearOutbox } from '../../src/lib/resend/index.js';
+import { clearWhatsappOutbox } from '../../src/lib/whatsapp/index.js';
 import { invalidatePermissionCache } from '../../src/modules/role/role.service.js';
 import { invalidateCalendarCache } from '../../src/modules/sla/sla.service.js';
 
@@ -14,6 +15,11 @@ import { invalidateCalendarCache } from '../../src/modules/sla/sla.service.js';
  */
 const TABLES = [
   'audit_logs',
+  'chat_sessions',
+  'inbound_channel_messages',
+  'outbound_channel_messages',
+  'channel_conversations',
+  'customer_channel_identities',
   'sso_login_requests',
   'sso_identities',
   'identity_providers',
@@ -98,4 +104,5 @@ export async function resetDatabase(): Promise<void> {
   // spec that publishes an article would be answered from the previous file's.
   clearMemoryCache();
   clearOutbox();
+  clearWhatsappOutbox();
 }

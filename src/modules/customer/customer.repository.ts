@@ -200,6 +200,40 @@ export function listDormantBefore(
 }
 
 /**
+ * Deletes the ones among these that are not customers of anything.
+ *
+ * Hard deletion rather than the anonymisation the retention sweep does, and the
+ * distinction is the point: anonymising exists to keep a row whose *tickets*
+ * still matter for reporting while removing the person from it. These rows have
+ * no tickets, no address and no channel thread left — a chat widget was opened
+ * and closed without a word being typed — so there is nothing to anonymise and
+ * nothing to report on.
+ *
+ * Every condition is re-checked here rather than trusted from the caller,
+ * because this is a delete: a caller that passed the wrong ids would otherwise
+ * remove real customers.
+ */
+export async function deleteOrphans(
+  customerIds: readonly string[],
+  exec: Executor = db,
+): Promise<number> {
+  if (customerIds.length === 0) return 0;
+
+  const removed = await exec.execute(sql`
+    delete from customers cu
+    where cu.id in ${customerIds}
+      and cu.email is null
+      and cu.deleted_at is null
+      and not exists (select 1 from tickets t where t.customer_id = cu.id)
+      and not exists (
+        select 1 from channel_conversations c where c.customer_id = cu.id
+      )
+  `);
+
+  return removed.rowCount ?? 0;
+}
+
+/**
  * Strips a customer's personal data, keeping the row.
  *
  * In place rather than deleted, because every ticket they ever raised points at

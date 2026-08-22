@@ -1,5 +1,6 @@
 import { createModuleLogger } from '../lib/logger/index.js';
 import { registerAttachmentJobs } from '../modules/attachment/index.js';
+import { registerConversationJobs } from '../modules/conversation/index.js';
 import { registerEscalationJobs } from '../modules/escalation/index.js';
 import { registerNotificationJobs } from '../modules/notification/index.js';
 import { registerReportJobs } from '../modules/report/index.js';
@@ -43,6 +44,7 @@ export function registerJobHandlers(): void {
   registerNotificationJobs();
   registerRetentionJobs();
   registerWebhookJobs();
+  registerConversationJobs();
 
   log.debug('job handlers registered');
 }

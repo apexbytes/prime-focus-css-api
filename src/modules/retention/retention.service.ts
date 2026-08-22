@@ -4,6 +4,8 @@ import { env } from '../../config/index.js';
 import { createModuleLogger } from '../../lib/logger/index.js';
 import * as attachmentService from '../attachment/attachment.service.js';
 import * as auditService from '../audit/audit.service.js';
+import * as chatService from '../chat/chat.service.js';
+import * as conversationService from '../conversation/conversation.service.js';
 import * as customerService from '../customer/customer.service.js';
 import * as messageService from '../message/message.service.js';
 import * as realtimeService from '../realtime/realtime.service.js';
@@ -47,6 +49,19 @@ export interface SweepResult {
   ticketLocksReleased: number;
   /** Expired federated sign-in requests, likewise: spent, and not personal data. */
   ssoLoginRequestsPurged: number;
+  /**
+   * Inbound and outbound channel envelopes past their period.
+   *
+   * The same class again: what a customer actually said on WhatsApp is on the
+   * ticket, which the ticket period above governs. These rows are the provider's
+   * envelope around it — kept long enough to debug a filing that went wrong, and
+   * no longer. Only settled inbound rows go; one still `received` or `failed` is
+   * unfiled work, and deleting it would lose a customer's message rather than a
+   * log line.
+   */
+  channelLogsDeleted: number;
+  /** Dead live-chat session tokens. Nothing but a credential nobody can use. */
+  chatSessionsPurged: number;
   /** True when the batch limit was reached, so there is more to do next run. */
   moreRemaining: boolean;
 }
@@ -142,6 +157,8 @@ export async function sweep(
       webhookDeliveriesDeleted: 0,
       ticketLocksReleased: 0,
       ssoLoginRequestsPurged: 0,
+      channelLogsDeleted: 0,
+      chatSessionsPurged: 0,
       moreRemaining: ticketIds.length === limit,
     };
   }
@@ -218,6 +235,16 @@ async function enforce(
   // cutoff is `now`, not a retention period: there is nothing to keep.
   const ssoLoginRequestsPurged = await ssoService.purgeLoginRequests(new Date(), limit);
 
+  // The channel envelopes share the webhook delivery log's period: both are a
+  // record of what crossed a provider boundary, and neither is the record of
+  // what was said.
+  const channelLogsDeleted = await conversationService.purgeChannelLogs(
+    daysBefore(env.WEBHOOK_DELIVERY_RETENTION_DAYS),
+  );
+  // `now`, not a period: a chat token expires in hours, so anything still here
+  // is already useless to whoever held it.
+  const chatSessionsPurged = await chatService.sweepExpiredSessions(new Date(), limit);
+
   return {
     dryRun: false,
     cutoffs,
@@ -229,11 +256,14 @@ async function enforce(
     webhookDeliveriesDeleted,
     ticketLocksReleased,
     ssoLoginRequestsPurged,
+    channelLogsDeleted,
+    chatSessionsPurged,
     moreRemaining:
       ticketIds.length === limit ||
       auditLogsDeleted === limit ||
       customersAnonymised === limit ||
-      webhookDeliveriesDeleted === limit,
+      webhookDeliveriesDeleted === limit ||
+      chatSessionsPurged === limit,
   };
 }
 

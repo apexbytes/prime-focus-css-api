@@ -8,6 +8,7 @@ export {
   queueDriver,
   ssoRedirectUrl,
   storageBackend,
+  whatsappTransport,
   antivirusDriver,
   isDevelopment,
   isProduction,

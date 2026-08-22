@@ -529,6 +529,151 @@ There is deliberately no "send a test event" button: it would have to fabricate 
 ticket, and a delivery log full of tickets that never existed teaches a receiver
 to accept them.
 
+## Omnichannel: WhatsApp and live chat
+
+Two channels a customer can reach the desk on and be answered on, added in
+Phase 8. Both feed the same pipeline as inbound email and land as ordinary
+tickets — routing, SLA clocks, escalation and reporting all apply without
+knowing which channel a ticket came from.
+
+The one thing to understand before reading further: **an agent replies the same
+way whatever the channel**. There is no per-channel endpoint. `POST
+/tickets/:id/messages` with `visibility: "public"` sends an email on an email
+ticket, a WhatsApp message on a WhatsApp ticket and a socket frame on a chat
+ticket, and `visibility: "internal"` still sends nothing anywhere.
+
+### WhatsApp
+
+```bash
+# Meta verifies the webhook URL once, with a GET. The reply is the bare
+# challenge string, because Meta compares bytes.
+curl "localhost:3000/api/v1/webhooks/whatsapp?hub.mode=subscribe\
+&hub.verify_token=$WHATSAPP_VERIFY_TOKEN&hub.challenge=1158201444"
+# → 1158201444
+
+# messages arrive here, signed. Unauthenticated and ahead of the rate limiter:
+# the signature is the credential, and WhatsApp arrives in bursts.
+POST /api/v1/webhooks/whatsapp
+x-hub-signature-256: sha256=<HMAC-SHA256(app secret, raw body)>
+```
+
+A message from a number nobody has seen creates a customer with **no email
+address**, records the number as that customer's WhatsApp identity, opens a
+thread and raises a ticket. The next message from the same number joins the same
+ticket. Set `WHATSAPP_PRODUCT_CODE` — one number serves the whole business, so
+unlike inbound email there is nothing in the message that says which product it
+is about, and with nothing configured the message waits in the backlog rather
+than being filed somewhere nobody looks.
+
+Without `WHATSAPP_ACCESS_TOKEN` and `WHATSAPP_PHONE_NUMBER_ID` the transport is
+`log`: replies are recorded and nothing is sent, which is how development runs.
+
+**Meta's 24-hour rule is real and you will meet it.** Outside 24 hours of the
+customer's last message, Meta refuses a free-form reply — only an approved
+template gets through. So the window is stored on the thread, checked before the
+send, and a refusal is written into the ticket as a system note, because in the
+console a refused reply otherwise looks exactly like a delivered one:
+
+```
+ℹ  This reply could not be delivered over whatsapp: the 24-hour WhatsApp reply
+   window has closed and no re-open template is configured
+```
+
+Set `WHATSAPP_REOPEN_TEMPLATE` to an approved template name and late replies go
+out through it instead.
+
+Two gaps, stated rather than hidden. Inbound **media is not downloaded** — a
+photo is recorded in the inbound log as `no readable body` and opens no ticket;
+fetching it means Meta's media endpoint, the object store, the virus scanner and
+a retention rule. And a customer with no address **gets no CSAT survey**: the
+survey is an email with a tokenised link, and `survey.dispatch` answers
+`skipped: customer has no email address` rather than sending into nothing.
+
+### Live chat
+
+```bash
+# public: is chat on, and where does the widget connect?
+curl localhost:3000/api/v1/chat/config
+
+# public: open a session. This is the only endpoint that hands an
+# unauthenticated caller a token.
+curl -X POST localhost:3000/api/v1/chat/sessions \
+  -H 'content-type: application/json' \
+  -d '{"displayName":"Rudo","page":"/transfers"}'
+# → { sessionToken, conversationExternalId, expiresAt, namespace, path }
+
+# every call after that carries the session token
+curl -X POST localhost:3000/api/v1/chat/messages \
+  -H "authorization: Bearer $SESSION" -H 'content-type: application/json' \
+  -d '{"body":"My card was declined at the till."}'
+
+# the public thread, for a widget that has just reloaded
+curl localhost:3000/api/v1/chat/transcript -H "authorization: Bearer $SESSION"
+
+# the visitor closes the conversation
+curl -X DELETE localhost:3000/api/v1/chat/session -H "authorization: Bearer $SESSION"
+```
+
+The visitor's socket lives on its **own namespace** (`CHAT_NAMESPACE`, default
+`/chat`) on the same `REALTIME_PATH` as the staff console:
+
+```js
+const socket = io('http://localhost:3000/chat', {
+  path: '/realtime',
+  auth: { sessionToken },
+});
+
+socket.emit('chat:send', { body: 'Anyone there?' }, (res) => res.data.ticketId);
+socket.emit('chat:typing', { isTyping: true });
+socket.emit('chat:transcript', {}, (res) => res.data);
+socket.emit('chat:end');
+
+socket.on('chat:message', (frame) => {}); // { author: 'agent' | 'customer', body }
+socket.on('chat:typing', (who) => {});
+socket.on('chat:ended', (why) => {});
+```
+
+A separate namespace rather than rooms on the staff connection, because the
+isolation is then structural instead of a check to remember: there is no client
+event that takes a room name, no ticket id anywhere in the protocol, and no
+locks, queue counts or notifications to reach. A staff token is refused here and
+a visitor token is refused on the staff namespace. Everything the socket does is
+also one of the REST calls above, so a widget behind a proxy that strips upgrades
+is slower rather than broken.
+
+An address typed into the widget is **contact detail, not identity**. It is
+recorded on the session for the agent to see and links to no existing customer
+record: anyone can type anybody's address, and matching on it would hand a
+stranger somebody else's thread history. An agent who establishes who they are
+talking to sets the address or merges the records — and a merge moves the
+channel identities with it.
+
+### The desk's view
+
+```bash
+# live threads, product-scoped like every other ticket read (perm channel:read)
+curl "localhost:3000/api/v1/conversations?channel=whatsapp&status=open" \
+  -H "authorization: Bearer $TOKEN"
+
+# messages recorded but not yet filed onto a ticket (perm channel:manage)
+curl localhost:3000/api/v1/conversations/inbound/unprocessed -H "authorization: Bearer $TOKEN"
+curl -X POST localhost:3000/api/v1/conversations/inbound/$ID/reprocess \
+  -H "authorization: Bearer $TOKEN"
+```
+
+A thread nobody has written on for `CONVERSATION_IDLE_HOURS` has its ticket
+pointer dropped, so a customer replying after a weekend joins the ticket they
+were discussing while "I have another problem" next month opens new work. The
+thread row itself survives — it holds the identity a returning customer is
+recognised by.
+
+Opening the chat panel creates a customer and a thread before anything is typed,
+because the session has to authorise something. The same hourly sweep deletes
+chat threads that never became a ticket, past twice `CHAT_SESSION_TTL_MINUTES`,
+along with the customer each one invented — so a visitor who closes the tab
+without a word leaves nothing behind. WhatsApp threads are never reaped: their
+identity is how a returning customer is recognised.
+
 ### Redis
 
 Redis holds the state that has to be _shared between instances_ — rate-limit
@@ -547,18 +692,20 @@ fails no request: the limiters pass and the caches miss.
 Jobs run on **pg-boss**, in the same process that serves HTTP, against its own
 `pgboss` schema. `/readyz` reports the queue alongside Postgres.
 
-| Job                   | Trigger                  | Does                                                |
-| --------------------- | ------------------------ | --------------------------------------------------- |
-| `ticket.triage`       | ticket created           | matches routing rules, sets the team                |
-| `ticket.autoassign`   | after triage             | picks an agent, or leaves it queued                 |
-| `sla.scan`            | cron, every minute       | records breaches, hands off to the ladder           |
-| `sla.escalate`        | from the scan            | fires escalation rungs                              |
-| `survey.dispatch`     | ticket resolved, delayed | emails the CSAT survey, or skips it                 |
-| `attachment.scan`     | bytes uploaded           | settles an attachment to clean/infected/skipped     |
-| `report.refresh`      | cron, every 15 min       | rebuilds the six reporting views                    |
-| `notification.digest` | cron, 07:00 CAT          | one email an agent about what is waiting            |
-| `retention.sweep`     | cron, Sundays 03:00      | enforces the retention policy, one batch            |
-| `webhook.deliver`     | a domain event           | signs and POSTs one delivery, retrying with backoff |
+| Job                       | Trigger                  | Does                                                 |
+| ------------------------- | ------------------------ | ---------------------------------------------------- |
+| `ticket.triage`           | ticket created           | matches routing rules, sets the team                 |
+| `ticket.autoassign`       | after triage             | picks an agent, or leaves it queued                  |
+| `sla.scan`                | cron, every minute       | records breaches, hands off to the ladder            |
+| `sla.escalate`            | from the scan            | fires escalation rungs                               |
+| `survey.dispatch`         | ticket resolved, delayed | emails the CSAT survey, or skips it                  |
+| `attachment.scan`         | bytes uploaded           | settles an attachment to clean/infected/skipped      |
+| `report.refresh`          | cron, every 15 min       | rebuilds the six reporting views                     |
+| `notification.digest`     | cron, 07:00 CAT          | one email an agent about what is waiting             |
+| `retention.sweep`         | cron, Sundays 03:00      | enforces the retention policy, one batch             |
+| `webhook.deliver`         | a domain event           | signs and POSTs one delivery, retrying with backoff  |
+| `channel.inbound.process` | WhatsApp webhook         | files an inbound message onto a ticket, or opens one |
+| `conversation.sweep`      | cron, hourly             | detaches idle threads, reaps abandoned chat widgets  |
 
 `QUEUE_DRIVER=inline` runs a job the moment it is enqueued and **fires no
 schedule**. Tests use it, so the job path is the path under test; setting it
@@ -585,8 +732,8 @@ Two more rules worth knowing before writing code:
 
 - `process.env` is read only in `src/config/env.ts`. Everything else imports `env`.
 - Nothing presented as a bearer credential is stored in the clear. Passwords are Argon2id;
-  refresh tokens, device tokens, invitation and reset tokens, API keys, login codes and SSO
-  `state` values are stored as keyed HMAC digests. The two exceptions are the values this
+  refresh tokens, device tokens, invitation and reset tokens, API keys, login codes, SSO
+  `state` values and live-chat session tokens are stored as keyed HMAC digests. The two exceptions are the values this
   API presents to somebody else rather than verifies — a webhook subscription's signing
   secret and an identity provider's client secret — and both are write-only through the
   API.

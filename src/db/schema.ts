@@ -52,3 +52,8 @@ export * from '../modules/webhook/webhook.model.js';
 
 // -- phase 7: federation ------------------------------------------------------
 export * from '../modules/sso/sso.model.js';
+
+// -- phase 8: omnichannel channels -------------------------------------------
+// conversation before chat: chat_sessions references channel_conversations.
+export * from '../modules/conversation/conversation.model.js';
+export * from '../modules/chat/chat.model.js';

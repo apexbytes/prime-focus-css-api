@@ -118,6 +118,17 @@ export const PERMISSION_CATALOGUE = [
       'Configure identity providers: which staff email domains may sign in through them, and with what client credentials',
     category: 'sso',
   },
+  // omnichannel channels (Phase 8)
+  {
+    code: 'channel:read',
+    description: 'View live chat and WhatsApp conversations and their inbound backlog',
+    category: 'channels',
+  },
+  {
+    code: 'channel:manage',
+    description: 'End a live-chat conversation and retry a message that failed to file',
+    category: 'channels',
+  },
   // retention (Phase 5)
   {
     code: 'retention:run',
@@ -192,6 +203,11 @@ export const SYSTEM_ROLES: readonly SystemRoleDefinition[] = [
       // signed-in member of staff.
       'sso:read',
       'sso:manage',
+      // A conversation is a ticket thread seen from the channel's side, so the
+      // read follows `ticket:read`; ending one is a moderation act, which is why
+      // it is separate.
+      'channel:read',
+      'channel:manage',
     ],
   },
   {
@@ -213,6 +229,8 @@ export const SYSTEM_ROLES: readonly SystemRoleDefinition[] = [
       'kb:read',
       'kb:manage',
       'report:view',
+      'channel:read',
+      'channel:manage',
     ],
   },
   {
@@ -229,6 +247,9 @@ export const SYSTEM_ROLES: readonly SystemRoleDefinition[] = [
       'ticket:assign_self',
       'ticket:escalate',
       'kb:read',
+      // Read only: a tier-1 agent works the conversations they are given and
+      // does not decide that somebody's chat is over.
+      'channel:read',
     ],
   },
 ] as const;

@@ -2,7 +2,12 @@ import { env } from '../../config/index.js';
 import { AppError } from '../../common/errors/index.js';
 import type { UserActor } from '../../common/types/actor.js';
 import { createModuleLogger } from '../../lib/logger/index.js';
-import { startSocketServer, type RealtimeSocket } from '../../lib/socket/index.js';
+import {
+  attachNamespace,
+  startSocketServer,
+  STAFF_NAMESPACE,
+  type RealtimeSocket,
+} from '../../lib/socket/index.js';
 import * as authService from '../auth/auth.service.js';
 import * as productService from '../product/product.service.js';
 import * as ticketService from '../ticket/ticket.service.js';
@@ -36,12 +41,16 @@ type Ack = (response: { ok: true; data?: unknown } | { ok: false; error: string 
  * a websocket that a corporate proxy strips must degrade to a slower console,
  * not a broken one.
  */
-export function startRealtime(httpServer: Parameters<typeof startSocketServer>[0]): Promise<void> {
-  return startSocketServer<UserActor>(httpServer, {
+export async function startRealtime(
+  httpServer: Parameters<typeof startSocketServer>[0],
+): Promise<void> {
+  attachNamespace<UserActor>(STAFF_NAMESPACE, {
     authenticate: async (credential) => {
       // Staff sessions only. A product system's API key is refused outright:
       // there is no console for it to open, and the rooms here carry internal
       // ticket state that a partner integration has no business subscribing to.
+      // A live-chat visitor's session token is refused for the same reason, and
+      // could not reach this namespace anyway — see `chat.gateway.ts`.
       if (!credential.token) throw AppError.unauthenticated();
 
       const actor = await authService.actorFromAccessToken(credential.token);
@@ -52,6 +61,8 @@ export function startRealtime(httpServer: Parameters<typeof startSocketServer>[0
     },
     onConnection: attach,
   });
+
+  await startSocketServer(httpServer);
 }
 
 function attach(socket: RealtimeSocket<UserActor>): void {

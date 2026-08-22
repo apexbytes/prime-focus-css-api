@@ -11,6 +11,8 @@ import {
   notFound,
   requestLogger,
 } from './common/middleware/index.js';
+import { chatRouter } from './modules/chat/index.js';
+import { whatsappWebhookRouter } from './modules/conversation/index.js';
 import { emailWebhookRouter } from './modules/email/index.js';
 import { healthRouter } from './modules/health/index.js';
 import { v1Router } from './routes/v1.js';
@@ -75,6 +77,10 @@ export function createApp(): Express {
    * customer email during exactly the spike support most needs to see.
    */
   app.use(`${API_PREFIX}/webhooks/resend`, emailWebhookRouter);
+  // Same argument, and it bites harder: WhatsApp traffic arrives in bursts by
+  // nature, and Meta redelivers anything it does not get a prompt 2xx for — so
+  // a throttled webhook turns one customer message into several.
+  app.use(`${API_PREFIX}/webhooks/whatsapp`, whatsappWebhookRouter);
 
   app.use(globalRateLimit);
   // After the global limiter, not instead of it: a product system is subject to
@@ -82,6 +88,21 @@ export function createApp(): Express {
   app.use(apiKeyRateLimit);
 
   app.use(healthRouter);
+
+  /**
+   * The live-chat widget's own surface, mounted ahead of `v1Router` and outside
+   * `authenticate` entirely.
+   *
+   * It is separate because its caller is separate: every route on `v1Router`
+   * answers to a staff session, an API key or a survey token, and this one
+   * answers to a chat session token held by a member of the public.
+   * Keeping it apart means a visitor's credential is resolved by exactly one
+   * controller and can never be mistaken for an `Actor`. It stays *inside* the
+   * rate limiters, unlike the provider webhooks: an anonymous endpoint that
+   * creates rows is the one thing on this API worth flooding.
+   */
+  app.use(`${API_PREFIX}/chat`, chatRouter);
+
   app.use(API_PREFIX, v1Router);
 
   app.use(notFound);

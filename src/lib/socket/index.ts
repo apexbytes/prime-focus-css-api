@@ -1,6 +1,6 @@
 import type { Server as HttpServer } from 'node:http';
 import { createAdapter } from '@socket.io/redis-adapter';
-import { Server as IoServer, type Socket } from 'socket.io';
+import { Server as IoServer, type Namespace, type Socket } from 'socket.io';
 import { corsOrigins, env } from '../../config/index.js';
 import { duplicateRedis } from '../redis/index.js';
 import { createModuleLogger } from '../logger/index.js';
@@ -18,30 +18,59 @@ export interface RealtimeSocket<TIdentity> extends Socket {
   data: { identity: TIdentity };
 }
 
-export interface SocketServerOptions<TIdentity> {
+/**
+ * Whatever the client put in the handshake `auth` object.
+ *
+ * One shape for every namespace rather than a generic, because the alternative
+ * is each gateway parsing `handshake.auth` itself — and the reason that parsing
+ * lives here is that `auth` is `any` at the Socket.IO boundary, so exactly one
+ * file should be doing the narrowing.
+ */
+export interface SocketCredential {
+  /** A staff access token. */
+  token?: string;
+  apiKey?: string;
+  /** A live-chat visitor's session token — see the `chat` module. */
+  sessionToken?: string;
+}
+
+export interface NamespaceOptions<TIdentity> {
   /**
    * Turns a handshake credential into an identity, or throws. Runs before the
    * connection is established — an unauthenticated socket is never allowed to
    * exist, rather than being allowed to connect and then policed per event.
    */
-  authenticate: (credential: { token?: string; apiKey?: string }) => Promise<TIdentity>;
+  authenticate: (credential: SocketCredential) => Promise<TIdentity>;
   /** Wires the domain events onto a freshly authenticated socket. */
   onConnection: (socket: RealtimeSocket<TIdentity>) => void;
 }
 
+/** The staff console's namespace: the Socket.IO default. */
+export const STAFF_NAMESPACE = '/';
+
 let io: IoServer | null = null;
+
+/**
+ * Namespaces asked for, whether or not the server is up yet.
+ *
+ * Registration is decoupled from the server's lifecycle so the call order in
+ * `server.ts` cannot matter: a gateway that registers before `listen()` is
+ * applied when the server starts, and one that registers after is applied
+ * immediately. The alternative is an ordering rule that is invisible until the
+ * day somebody reorders two lines and one namespace silently stops accepting
+ * connections.
+ */
+const namespaces = new Map<string, NamespaceOptions<unknown>>();
 
 /**
  * Attaches Socket.IO to the running HTTP server.
  *
  * Called from `server.ts` after `listen()`, never from `createApp()`: a
  * Supertest run must not open a websocket server, and the app has to stay
- * importable without one.
+ * importable without one. Idempotent, so several gateways may each make sure
+ * the server exists before registering their namespace.
  */
-export async function startSocketServer<TIdentity>(
-  httpServer: HttpServer,
-  options: SocketServerOptions<TIdentity>,
-): Promise<void> {
+export async function startSocketServer(httpServer: HttpServer): Promise<void> {
   if (!env.REALTIME_ENABLED || io) return;
 
   const server = new IoServer(httpServer, {
@@ -57,37 +86,74 @@ export async function startSocketServer<TIdentity>(
 
   await attachRedisAdapter(server);
 
+  io = server;
+
+  for (const [name, options] of namespaces) {
+    wire(name, options);
+  }
+
+  log.info('realtime server listening', {
+    path: env.REALTIME_PATH,
+    namespaces: [...namespaces.keys()],
+  });
+}
+
+/**
+ * Declares a protocol on one namespace.
+ *
+ * Namespaces rather than rooms on a shared connection, because the two
+ * audiences are not the same kind of caller: the staff console is a signed-in
+ * member of the desk, and a live-chat visitor is a member of the public holding
+ * a token for one conversation. Separate namespaces means separate handshake
+ * authentication and separate event handlers, so there is no code path on which
+ * a visitor's socket can be sent a staff event or join a staff room — the
+ * isolation is structural rather than a check somebody has to remember.
+ */
+export function attachNamespace<TIdentity>(
+  name: string,
+  options: NamespaceOptions<TIdentity>,
+): void {
+  namespaces.set(name, options as NamespaceOptions<unknown>);
+  if (io) wire(name, options as NamespaceOptions<unknown>);
+}
+
+function wire(name: string, options: NamespaceOptions<unknown>): void {
+  const namespace = io?.of(name);
+  if (!namespace) return;
+
+  // Guard against a second `startSocketServer` — or a re-registration — stacking
+  // duplicate handlers, which would authenticate twice and emit twice.
+  namespace.removeAllListeners('connection');
+
   /**
    * Authentication runs once, in the handshake. `auth` rather than a query
    * string: a token in the URL lands in proxy logs, which is the same rule the
    * REST API follows.
    */
-  server.use((socket, next) => {
-    const auth = socket.handshake.auth as { token?: unknown; apiKey?: unknown };
+  namespace.use((socket, next) => {
+    const auth = socket.handshake.auth as Record<string, unknown>;
 
     void options
       .authenticate({
-        token: typeof auth.token === 'string' ? auth.token : undefined,
-        apiKey: typeof auth.apiKey === 'string' ? auth.apiKey : undefined,
+        ...(typeof auth.token === 'string' ? { token: auth.token } : {}),
+        ...(typeof auth.apiKey === 'string' ? { apiKey: auth.apiKey } : {}),
+        ...(typeof auth.sessionToken === 'string' ? { sessionToken: auth.sessionToken } : {}),
       })
       .then((identity) => {
-        (socket as RealtimeSocket<TIdentity>).data.identity = identity;
+        (socket as RealtimeSocket<unknown>).data.identity = identity;
         next();
       })
       .catch((error: unknown) => {
         // The client is told the connection was refused and nothing else. A
         // websocket handshake is a fine place to probe for valid tokens.
-        log.debug('socket authentication refused', { err: error });
+        log.debug('socket authentication refused', { namespace: name, err: error });
         next(new Error('unauthorised'));
       });
   });
 
-  server.on('connection', (socket) => {
-    options.onConnection(socket as RealtimeSocket<TIdentity>);
+  namespace.on('connection', (socket) => {
+    options.onConnection(socket as RealtimeSocket<unknown>);
   });
-
-  io = server;
-  log.info('realtime server listening', { path: env.REALTIME_PATH });
 }
 
 /**
@@ -121,31 +187,51 @@ async function attachRedisAdapter(server: IoServer): Promise<void> {
  * Never throws and never awaits delivery: every caller is a domain service that
  * has already committed its change, and a browser that missed a notification
  * refetches. Realtime is a courtesy on top of the REST API, never the record.
+ *
+ * The namespace is an explicit argument with a staff default, so sending to a
+ * visitor's room is something a caller has to say it means.
  */
-export function broadcast(room: string | string[], event: string, payload: unknown): void {
-  if (!io) return;
+export function broadcast(
+  room: string | string[],
+  event: string,
+  payload: unknown,
+  namespace: string = STAFF_NAMESPACE,
+): void {
+  const target = resolveNamespace(namespace);
+  if (!target) return;
 
   try {
     // An array rather than chained `to()` calls: Socket.IO delivers once to a
     // socket that is in several of the rooms, which is the whole reason a ticket
     // event can name both its ticket room and its product room.
-    io.to(room).emit(event, payload);
+    target.to(room).emit(event, payload);
   } catch (error) {
-    log.warn('broadcast failed', { room, event, err: error });
+    log.warn('broadcast failed', { room, event, namespace, err: error });
   }
 }
 
 /** Every socket currently in a room, across instances. */
-export async function socketsInRoom(room: string): Promise<number> {
-  if (!io) return 0;
+export async function socketsInRoom(
+  room: string,
+  namespace: string = STAFF_NAMESPACE,
+): Promise<number> {
+  const target = resolveNamespace(namespace);
+  if (!target) return 0;
 
   try {
-    const sockets = await io.in(room).fetchSockets();
+    const sockets = await target.in(room).fetchSockets();
     return sockets.length;
   } catch (error) {
-    log.warn('room census failed', { room, err: error });
+    log.warn('room census failed', { room, namespace, err: error });
     return 0;
   }
+}
+
+function resolveNamespace(name: string): Namespace | null {
+  if (!io) return null;
+  // `of()` creates on demand, which would quietly manufacture a namespace
+  // nothing is listening on if a caller mistyped one.
+  return namespaces.has(name) ? io.of(name) : null;
 }
 
 export interface SocketHealth {
@@ -175,6 +261,12 @@ export function stopSocketServer(): void {
   const server = io;
   io = null;
   if (!server) return;
+
+  // Every namespace, not just the default: a visitor's chat socket holds the
+  // HTTP server open exactly as firmly as an agent's does.
+  for (const name of namespaces.keys()) {
+    server.of(name).disconnectSockets(true);
+  }
 
   server.disconnectSockets(true);
   server.engine.close();

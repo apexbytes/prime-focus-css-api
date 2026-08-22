@@ -6,6 +6,7 @@ import { attachmentItemRouter } from '../modules/attachment/index.js';
 import { auditRouter } from '../modules/audit/index.js';
 import { authRouter } from '../modules/auth/index.js';
 import { categoryRouter } from '../modules/category/index.js';
+import { conversationRouter } from '../modules/conversation/index.js';
 import { customerRouter } from '../modules/customer/index.js';
 import { emailAdminRouter } from '../modules/email/index.js';
 import { escalationRuleRouter } from '../modules/escalation/index.js';
@@ -58,6 +59,7 @@ const MODULES = [
   'realtime',
   'webhook-subscriptions',
   'identity-providers',
+  'conversations',
 ] as const;
 
 /**
@@ -123,6 +125,13 @@ v1Router.use('/surveys', surveyPublicRouter);
 v1Router.use('/csat', csatRouter);
 v1Router.use('/reports', reportRouter);
 v1Router.use('/retention', retentionRouter);
+
+// -- omnichannel channels -----------------------------------------------------
+// The staff view of channel threads. The inbound WhatsApp webhook and the chat
+// widget's own surface are both mounted in app.ts instead: one is authenticated
+// by signature and must skip the rate limiter, and the other is authenticated by
+// a visitor token that must never be resolved into an `Actor`.
+v1Router.use('/conversations', conversationRouter);
 
 // -- realtime & outbound webhooks ---------------------------------------------
 v1Router.use('/realtime', realtimeRouter);

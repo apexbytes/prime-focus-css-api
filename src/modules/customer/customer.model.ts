@@ -14,8 +14,24 @@ export const customers = pgTable(
   'customers',
   {
     id: uuid('id').primaryKey().defaultRandom(),
-    /** Lower-cased at the validation boundary; the identity key for inbound mail. */
-    email: text('email').notNull().unique(),
+    /**
+     * Lower-cased at the validation boundary; the identity key for inbound mail.
+     *
+     * Nullable since Phase 8, and the reason is worth stating: a customer who
+     * first reaches the desk over WhatsApp or the chat widget has a phone number
+     * or a browser session and no address at all. The alternatives were both
+     * worse than a nullable column. Synthesising `263771234567@whatsapp.invalid`
+     * would put a fake address in the one field every outbound email path reads,
+     * so a CSAT survey would be mailed into a black hole forever and nobody
+     * would know. Refusing to record the customer would mean a WhatsApp
+     * conversation with no customer on it.
+     *
+     * Postgres treats NULLs as distinct, so the unique constraint still holds
+     * exactly the property it held before: at most one customer per address.
+     * Every send path now asks whether there is an address instead of assuming
+     * one — see `conversation.service.dispatchReply` and `survey.service`.
+     */
+    email: text('email').unique(),
     fullName: text('full_name').notNull(),
     phone: text('phone'),
     /** ISO code; drives which language a reply template is rendered in. */

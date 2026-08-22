@@ -163,7 +163,11 @@ function render(
   template: string,
   context: {
     ticket: { reference: string; subject: string };
-    customer: { fullName: string; email: string };
+    // Nullable since Phase 8: a customer who arrived over WhatsApp has no
+    // address. Nothing in the placeholder set uses it, and it stays in the
+    // context because a macro body that wants `{{customer.email}}` is a
+    // plausible next request.
+    customer: { fullName: string; email: string | null };
     actor: Actor;
   },
 ): string {
