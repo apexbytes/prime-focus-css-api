@@ -26,6 +26,18 @@ export const createCustomerBody = z.object({
 export const updateCustomerBody = z
   .object({
     fullName: z.string().trim().min(2).max(160).optional(),
+    /**
+     * Settable since Phase 8, because a customer can now exist without one: a
+     * person who reached the desk over WhatsApp has a number and no address, and
+     * until an agent records the one they give out every email path for them —
+     * the CSAT survey most of all — has nowhere to go.
+     *
+     * Not nullable, unlike `phone` and `notes`. Clearing an address is not an
+     * edit, it is severing the identity key inbound mail threads on and every
+     * other customer's uniqueness check depends on; a record that should not be
+     * reachable is deleted or merged, which are their own endpoints.
+     */
+    email: email.optional(),
     phone: z.string().trim().min(6).max(32).nullable().optional(),
     language: z.string().trim().length(2).toLowerCase().optional(),
     tier: z.enum(['standard', 'priority', 'vip']).optional(),

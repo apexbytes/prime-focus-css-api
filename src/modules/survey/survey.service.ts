@@ -6,6 +6,7 @@ import { withTransaction } from '../../db/transaction.js';
 import { createModuleLogger } from '../../lib/logger/index.js';
 import { csatSurveyEmail, sendEmail, webUrl } from '../../lib/resend/index.js';
 import * as auditService from '../audit/audit.service.js';
+import * as conversationService from '../conversation/conversation.service.js';
 import * as eventService from '../event/event.service.js';
 import { DOMAIN_EVENT } from '../event/event.types.js';
 import * as customerService from '../customer/customer.service.js';
@@ -66,16 +67,20 @@ export async function dispatch(ticketId: string): Promise<DispatchResult> {
     return { status: 'skipped', reason: 'customer record is gone' };
   }
 
-  // Since Phase 8 a customer may have reached the desk over WhatsApp or the chat
-  // widget and have no address at all. The survey is an email with a tokenised
-  // link in it, and there is no address to send it to — so it is skipped, with a
-  // reason, rather than mailed at a placeholder nobody reads. Asking for a score
-  // over WhatsApp would need an approved template and a way to receive a number
-  // back as a rating; that is a channel feature, not a null check, and it is not
-  // built. Response rate is a reported metric, so a skip that says why is worth
-  // more here than a send that quietly fails.
-  if (!customer.email) {
-    return { status: 'skipped', reason: 'customer has no email address' };
+  // How this customer can be reached, decided before a row is written: a survey
+  // that could never be delivered would sit with `sent_at` null forever and drag
+  // down a response rate it was never part of.
+  //
+  // An address wins when there is one — a link in a mailbox outlives any
+  // conversation. Failing that, the channel the ticket arrived on is asked
+  // whether it can still reach anybody, which for WhatsApp it can and for a
+  // closed browser tab it cannot.
+  const route = await resolveRoute(ticket.id, customer.email);
+  if (!route) {
+    return { status: 'skipped', reason: 'no way to reach this customer' };
+  }
+  if (route.kind === 'unreachable') {
+    return { status: 'skipped', reason: route.reason };
   }
 
   const recent = await repository.lastForCustomer(customer.id);
@@ -121,27 +126,41 @@ export async function dispatch(ticketId: string): Promise<DispatchResult> {
     return row;
   });
 
-  const rendered = csatSurveyEmail({
-    fullName: customer.fullName,
-    reference: ticket.reference,
-    subject: ticket.subject,
-    productName: product.name,
-    agentName: agent?.fullName ?? null,
-    // The link lands on the console, which then POSTs the score. A GET that
-    // recorded a rating would be cast by the first mail scanner to follow it.
-    surveyUrl: (score) => webUrl('/survey', { token, score: String(score) }),
-  });
-
-  const result = await sendEmail({ ...rendered, to: customer.email, kind: 'csat_survey' });
+  const result =
+    route.kind === 'email'
+      ? await sendByEmail({
+          to: route.email,
+          token,
+          customerName: customer.fullName,
+          reference: ticket.reference,
+          subject: ticket.subject,
+          productName: product.name,
+          agentName: agent?.fullName ?? null,
+        })
+      : await conversationService.sendSurveyInvite({
+          ticketId: ticket.id,
+          // One link rather than one per score. Five URLs in a WhatsApp message
+          // reads as spam, and link previews are off on this channel anyway, so
+          // the per-score shortcut the email uses buys nothing here.
+          body: `Your ${product.name} query ${ticket.reference} is resolved. How did we do? Tap to rate from 1 to 5:\n\n${webUrl('/survey', { token })}`,
+        });
 
   if (!result.delivered) {
-    // The row stays, unsent: the token is still valid, and a resend is a matter
-    // of re-rendering the same link rather than issuing a new survey.
+    // The row stays with `sent_at` null: the token is still valid, and a resend
+    // is a matter of re-sending the same link rather than issuing a new survey.
+    // Unsent rows are what keep the response rate honest — a survey nobody
+    // received is not a survey nobody answered.
     log.error('csat survey could not be delivered', {
       surveyId: survey.id,
       ticketId: ticket.id,
+      via: route.kind,
+      reason: result.reason,
     });
-    return { status: 'skipped', reason: 'delivery failed', surveyId: survey.id };
+    return {
+      status: 'skipped',
+      reason: result.reason ?? 'delivery failed',
+      surveyId: survey.id,
+    };
   }
 
   await repository.update(survey.id, { sentAt: new Date() });
@@ -150,9 +169,55 @@ export async function dispatch(ticketId: string): Promise<DispatchResult> {
     surveyId: survey.id,
     ticketId: ticket.id,
     reference: ticket.reference,
+    via: route.kind,
   });
 
   return { status: 'sent', surveyId: survey.id };
+}
+
+/**
+ * Where a survey for this ticket can go.
+ *
+ * An address beats a conversation whenever there is one, because a link in a
+ * mailbox is still there next week and a WhatsApp reply window is not.
+ */
+type SurveyRoute =
+  { kind: 'email'; email: string } | { kind: 'channel' } | { kind: 'unreachable'; reason: string };
+
+async function resolveRoute(ticketId: string, email: string | null): Promise<SurveyRoute | null> {
+  if (email) return { kind: 'email', email };
+
+  const { channel, reason } = await conversationService.surveyableChannel(ticketId);
+  if (channel) return { kind: 'channel' };
+
+  return { kind: 'unreachable', reason: reason ?? 'no way to reach this customer' };
+}
+
+async function sendByEmail(input: {
+  to: string;
+  token: string;
+  customerName: string;
+  reference: string;
+  subject: string;
+  productName: string;
+  agentName: string | null;
+}): Promise<{ delivered: boolean; reason?: string }> {
+  const rendered = csatSurveyEmail({
+    fullName: input.customerName,
+    reference: input.reference,
+    subject: input.subject,
+    productName: input.productName,
+    agentName: input.agentName,
+    // The link lands on the console, which then POSTs the score. A GET that
+    // recorded a rating would be cast by the first mail scanner to follow it.
+    surveyUrl: (score) => webUrl('/survey', { token: input.token, score: String(score) }),
+  });
+
+  const result = await sendEmail({ ...rendered, to: input.to, kind: 'csat_survey' });
+  return {
+    delivered: result.delivered,
+    ...(result.delivered ? {} : { reason: 'delivery failed' }),
+  };
 }
 
 function withinCooldown(sentAt: Date): boolean {

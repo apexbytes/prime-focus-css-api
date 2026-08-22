@@ -138,6 +138,14 @@ export const inboundChannelMessages = pgTable(
     fromIdentifier: text('from_identifier').notNull(),
     displayName: text('display_name'),
     body: text('body'),
+    /**
+     * The normalised descriptor of a file that came with the message: its
+     * provider **id**, mime type and digest — never a URL, because a provider's
+     * download URL lives minutes and the id lives days, so this is what makes a
+     * retry tomorrow work. Its own column rather than being re-parsed out of
+     * `payload` on every retry, which would put the same parsing in two places.
+     */
+    media: jsonb('media'),
     status: inboundChannelMessageStatus('status').notNull().default('received'),
     conversationId: uuid('conversation_id').references(() => channelConversations.id, {
       onDelete: 'set null',

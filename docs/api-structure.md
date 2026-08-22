@@ -234,7 +234,7 @@ Grouped by domain; each is a folder in `src/modules/`.
 ### 3.5 Self-service & feedback
 
 - **knowledge-base** — articles with draft/in_review/published/archived states, product + category scoping, Postgres full-text search (`tsvector` generated column, weighted title/keywords/body, GIN), per-edit revisions, view + helpfulness counters, and the `suggest` endpoint the ticket-creation flow calls for deflection. `visibility: internal | public` is required with no default and defaults to `internal` in the database: `internal` articles are agent runbooks, and `suggest` exists to show text to customers.
-- **survey** — CSAT: a token-based one-click rating emailed after resolution, score + comment. The token is the only bearer credential this API accepts in a URL, and the trade-off is argued in §8. Aggregation lives in `report`.
+- **survey** — CSAT: a token-based one-click rating sent after resolution — emailed when the customer has an address, otherwise sent down the channel the ticket arrived on (§8) — score + comment. The token is the only bearer credential this API accepts in a URL, and the trade-off is argued in §8. Aggregation lives in `report`.
 
 ### 3.6 Platform services
 
@@ -373,6 +373,12 @@ at whichever ticket is currently receiving messages and is null between them. Th
 alternative — a row per ticket — makes "which thread is this message on" a
 most-recent-open query with a race in it, and leaves nowhere to keep
 `window_expires_at`, which belongs to the thread and to no ticket in it.
+
+`inbound_channel_messages.media` holds the normalised descriptor of a file that
+came with the message — its provider **id**, mime type and digest, never a URL. A
+provider's download URL lives about five minutes and the id lives seven days, so
+the id is the only thing worth persisting; its own column rather than re-parsed
+out of `payload` on each retry, which would put the same parsing in two places.
 
 `inbound_channel_messages` is unique on `provider_message_id`, which is the
 deduplication: Meta redelivers any webhook it did not get a prompt 2xx for, and a
@@ -1359,16 +1365,64 @@ Decisions worth knowing:
   envelope is not mistaken for an empty message envelope, but nothing is stored:
   this system does not show a customer's read state to agents, and a row per
   receipt on a busy number is a large table nobody reads.
-- **Media is recorded, not fetched.** A photo of a failed ATM screen is exactly
-  the attachment an agent wants, and downloading it means Meta's media endpoint,
-  the object store, the virus scanner and a retention rule — four things, not
-  one. Until then the message is filed as `ignored` with `no readable body`,
-  which is visible in the operator backlog rather than silently absent.
-- **CSAT is skipped, not adapted.** The survey is an email with a tokenised link;
-  asking for a score over WhatsApp needs an approved template and a way to read a
-  digit back as a rating. `dispatch` answers `skipped` with a reason, because
-  response rate is itself a reported number and a send that quietly fails would
-  corrupt it.
+- **Media is downloaded, and the id is why it can be.** Added as a follow-up
+  shortly after the phase, because a photo of a failed ATM screen is exactly the
+  attachment an agent wants. A webhook carries a media **id**, never bytes and
+  never a usable URL: resolving it is a second call that returns a URL good for
+  about five minutes, while the id itself is good for seven days. So the id is
+  what gets stored — in a `media` column on the inbound row, normalised, rather
+  than re-parsed out of `payload` on every retry — and a job retried tomorrow
+  still works where a stored URL would be long dead. The download runs inside
+  `channel.inbound.process` for that reason, not lazily when an agent opens the
+  ticket.
+
+  It runs **after** the message commits, never inside its transaction: two calls
+  to Meta plus an object-store write is a network round trip to hold a Postgres
+  lock across. The consequence is deliberate — a failure leaves the customer's
+  words on the ticket without their file, which is far better than losing the
+  message because a download timed out — and either way an agent gets a system
+  note saying why there is no file on a ticket that plainly mentions one. An
+  oversized file is refused on the metadata, before any bytes move, and the note
+  says to ask the customer for it another way.
+
+  What it reuses matters more than what it added: the same denylist, the same
+  `ATTACHMENT_MAX_BYTES` cap, the same object store and the same
+  `attachment.scan` job — so a file from WhatsApp is exactly as
+  unscanned-until-proven as one from a browser, and the retention sweep already
+  deletes it with the ticket. A customer-supplied filename is stripped to a
+  basename and never becomes a storage key.
+
+- **CSAT goes down the channel too, as the same tokenised link.** Added as a
+  follow-up alongside media. `survey.dispatch` had the defect `message.service`
+  had before this phase — a send path fused to email — so it got the same fix: it
+  asks where the customer can be reached and routes accordingly, through the same
+  `send` the replies use, so the reply window, the template fallback and the
+  outbound record all apply without being restated.
+
+  An address wins whenever there is one, because a link in a mailbox outlives any
+  conversation. Failing that, WhatsApp gets the ordinary survey link as plain
+  text — one link, not the five per-score shortcuts the email uses, since five
+  URLs in a WhatsApp message reads as spam and link previews are off on that
+  channel anyway. The token, the fourteen-day expiry, the one-per-ticket
+  constraint, the cooldown and `GET`/`POST /surveys/:token` are untouched, so a
+  score arrives by exactly the path an emailed one does.
+
+  **Live chat is still skipped, and that is a decision rather than an
+  oversight.** A phone number still reaches somebody an hour after resolution; a
+  closed browser tab does not, and the chat transport records a send as delivered
+  whether or not anybody is listening. Surveying it would inflate the
+  response-rate denominator with surveys nobody could have seen — which is what
+  the original skip was protecting, so it is kept and given a clearer reason. For
+  the same reason a survey the provider refuses leaves its row with `sent_at`
+  null: a survey nobody received is not a survey nobody answered.
+
+  Reply buttons would be better than a link — an `interactive` payload cannot be
+  misread the way a digit can — but they need inbound handling for that type and
+  a quick-reply template approved in Meta's console, so they stay a follow-up.
+  Parsing a digit out of the next message is the option deliberately **not**
+  taken: a customer answering "5" to mean five days would be recorded as a
+  rating, and the message would be stolen from the thread rather than filed.
+
 - **A visitor's rate limit lives in the service, not in middleware.** A socket
   frame never passes through an Express limiter, so without it one visitor could
   write a thousand messages into a ticket. It is counted through the shared cache
@@ -1488,6 +1542,14 @@ or malformed — never `process.env.X` anywhere else in the codebase.
   refusals that matter — a visitor token on the staff namespace and a staff token
   on the chat one. A stubbed ingress would assert that our own code was called
   and prove nothing about either.
+
+  Media retrieval is the one part stubbed, at the `lib/whatsapp` boundary and for
+  the reason the inbound email body is stubbed there: a webhook carries no bytes,
+  so without a live Meta account there is nothing to fetch. What the stub does
+  not cover is named — the two HTTP calls themselves — and everything after them
+  is real: the size refusal, the filename stripping, the attachment row, the scan
+  job, and the system note when a download fails.
+
 - **Authorisation matrix** — a table-driven test asserting each role × endpoint
   outcome. This is the one suite that must never be skipped: RBAC regressions
   in a fintech leak customer financial data.
@@ -1521,10 +1583,14 @@ Called out so the trade-offs are explicit, not silently dropped:
    VoIP is still out, and deliberately rather than by omission: a voice channel
    is not another text adapter. It needs a recording store, a transcription step
    and a retention argument of its own, and adding `phone` to the enum without
-   them would be schema pretending to be a feature. Two smaller gaps inside the
-   channels that _are_ built, stated rather than hidden: inbound media is
-   recorded as unreadable rather than downloaded, and CSAT is skipped for a
-   customer with no address instead of being asked over the channel.
+   them would be schema pretending to be a feature.
+
+   Both gaps this phase shipped with are now closed — inbound media is
+   downloaded, and CSAT is asked over the channel as the same tokenised link
+   (§8). What remains is narrower and deliberate: live chat is not surveyed,
+   because a closed browser tab is not somewhere to reach anybody an hour later,
+   and a score is collected through a link rather than reply buttons, which would
+   need a template approved in Meta's console.
 
 4. **Data lake → materialised views.** Real-time dashboards come from Postgres
    materialised views refreshed on a schedule, as built in Phase 5: six views,

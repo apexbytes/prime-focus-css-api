@@ -1,0 +1,1 @@
+ALTER TABLE "inbound_channel_messages" ADD COLUMN "media" jsonb;

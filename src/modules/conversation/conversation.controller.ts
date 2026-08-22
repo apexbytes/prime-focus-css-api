@@ -7,7 +7,12 @@ import { sendSuccess } from '../../common/utils/response.js';
 import { createModuleLogger } from '../../lib/logger/index.js';
 import { SIGNATURE_HEADER, verifyWhatsappSignature } from '../../lib/whatsapp/index.js';
 import * as conversationService from './conversation.service.js';
-import type { ListConversationsQuery, WhatsappWebhookBody } from './conversation.schema.js';
+import type {
+  ListConversationsQuery,
+  WhatsappInboundMessage,
+  WhatsappWebhookBody,
+} from './conversation.schema.js';
+import { MEDIA_KINDS, type NormalisedInboundMedia } from './conversation.types.js';
 
 const log = createModuleLogger('conversation:webhook');
 
@@ -84,11 +89,12 @@ export async function receiveWhatsapp(req: Request, res: Response): Promise<void
       const profileName = value.contacts?.[0]?.profile?.name;
 
       for (const message of value.messages ?? []) {
-        // Anything that is not text: an image, a voice note, a location. The
-        // desk cannot read it and this phase does not download media, so it is
-        // recorded with no body and the pipeline ignores it — visibly, in the
-        // inbound log, rather than being dropped on the floor here.
-        const text = message.type === 'text' ? (message.text?.body ?? null) : null;
+        // A media message's text is its caption, which is often absent — so the
+        // body and the attachment are two independent things here, and a message
+        // with neither is what the pipeline treats as unreadable.
+        const media = mediaFrom(message);
+        const text =
+          message.type === 'text' ? (message.text?.body ?? null) : (captionFrom(message) ?? null);
 
         try {
           const { id, duplicate } = await conversationService.recordInbound({
@@ -100,6 +106,7 @@ export async function receiveWhatsapp(req: Request, res: Response): Promise<void
             fromIdentifier: message.from,
             ...(profileName ? { displayName: profileName } : {}),
             body: text,
+            ...(media ? { media } : {}),
             payload: { entryId: entry.id, message, metadata: value.metadata },
             ...(message.timestamp
               ? { occurredAt: new Date(Number(message.timestamp) * 1000) }
@@ -150,6 +157,41 @@ function verifySignature(req: Request): void {
     log.warn('rejected a whatsapp webhook with an invalid signature');
     throw new AppError(401, ErrorCode.UNAUTHENTICATED, 'Invalid webhook signature');
   }
+}
+
+/**
+ * Pulls the media descriptor out of whichever key Meta used.
+ *
+ * The type field and the key agree — a `type: "image"` message carries an
+ * `image` object — so this reads the type rather than probing every key, which
+ * keeps an unknown future type from being mistaken for one of these.
+ *
+ * Nothing is fetched: the id travels on the durable row and the filing job
+ * resolves it, because a download URL would be dead by then.
+ */
+function mediaFrom(message: WhatsappInboundMessage): NormalisedInboundMedia | null {
+  const kind = MEDIA_KINDS.find((candidate) => candidate === message.type);
+  if (!kind) return null;
+
+  const media = message[kind];
+  if (!media?.id) return null;
+
+  return {
+    kind,
+    providerMediaId: media.id,
+    mimeType: media.mime_type ?? null,
+    sha256: media.sha256 ?? null,
+    // Only a document arrives named. Everything else is named by the pipeline,
+    // from the type and the mime type — a filename from a customer is untrusted
+    // input either way and never becomes a storage key.
+    filename: media.filename ?? null,
+    ...(media.voice === undefined ? {} : { voice: media.voice }),
+  };
+}
+
+/** Images, videos and documents may carry one; audio and stickers never do. */
+function captionFrom(message: WhatsappInboundMessage): string | undefined {
+  return message.image?.caption ?? message.video?.caption ?? message.document?.caption ?? undefined;
 }
 
 // -- staff surface ------------------------------------------------------------
